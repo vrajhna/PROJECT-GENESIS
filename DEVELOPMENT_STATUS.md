@@ -445,3 +445,54 @@
   in the client bundle).
 - Caught while wiring: stray JS-isms in new Python (`String()`,
   `.toLowerCase`) — tests + live run found them, fixed, re-verified, swept.
+
+## 2026-11-03 — Flappy fix (live-reported defects, both real)
+
+- Defect 1: a "flappy bird" spec built the generic scaffold — `GAME_HINT`
+  never matched flappy-family words, and the only game template was Snake.
+  Fixed: hint list widened (flappy/flap/game over/scoreboard/high score/
+  canvas game/bird game/playable/…) with the `cart` exclusion kept; new
+  `FLAPPY_HINT` selects a dedicated Flappy template (canvas bird, gravity,
+  pipes, collision, tap/click/space, die → name prompt → same `/api/scores`
+  contract + scoreboard as Snake). Decision text + `report["flappy"]`
+  follow the template. Rebuilds are marker-gated, user files untouched.
+- Defect 2: the studio preview iframe pointed at a `127.0.0.1` build port
+  that dies with the build (dead on Railway by design). Fixed: once
+  published, the frame embeds the public `/p/{slug}/` URL instead
+  (sandbox `allow-scripts allow-modals` so the score prompt works);
+  opening a project restores its published link; new projects reset it.
+- Tests: new `test_flappy_builds_with_flap_and_pipes` — flappy spec →
+  VERIFIED, `report["flappy"]`, flap+pipe markers, canvas, score contract,
+  Flappy decision. Snake test still green (no regression).
+- Verified: 2 game tests + `test_fullstack_choices` green (`8 passed`);
+  frontend typecheck + build clean.
+
+## 2026-11-03 — Genesis proper: the MODEL writes the app (Wonder, full aggression)
+
+- Founder correction, accepted: hardcoded game templates are a fallback, not
+  Genesis. Genesis = any idea in → model writes the code → pipeline proves
+  it → every stage visible. Templates stay for offline/no-key builds only.
+- New `app/builder/codegen.py`: `generate_with_model()` asks the model for
+  a complete app as JSON `{files: {path: content}}` and enforces the contract
+  BEFORE writing: exact file set, paths confined (no `..`, no absolute),
+  200KB/file + 400KB total caps, secret-pattern scan, `backend/server.py`
+  must bind localhost. Any violation → template fallback, never a crash.
+- Routing: task kind `"multi-file codegen"` hits `COMPLEX_HINTS`, so
+  generation ALWAYS uses the advanced model (Wonder), never Spark.
+  `META_ADVANCED_MODEL` env selects the exact Wonder variant with zero code
+  change (e.g. a Wonder Full ID). Generation timeout floor raised to 120s.
+- New versioned prompt `codegen.fullstack v1`: the full generated-app
+  contract (stdlib backend, health/resources/scores/auth routes, static
+  frontend with canvas game when asked, urllib tests, pytest-only deps,
+  forbidden list). Literal braces escaped for `.format()`.
+- `build_fullstack` now records `report["author"]` + a decision line:
+  `author: model <id> (N files, Xms)` vs `author: offline template (reason)`.
+  Shown in the studio timeline automatically. Pipeline steps unchanged —
+  they prove model-written code exactly like template code.
+- Tests: new `test_codegen.py` — 9 passed (Wonder routing recorded, contract
+  rejections for traversal/secrets/missing/localhost, no-key fallback,
+  extractor shapes; live test skipped without a key). Regression:
+  fullstack + intelligence suites `21 passed, 1 skipped`.
+- Proven locally with fakes only (no key on this machine). Live proof needs
+  a key: Railway already has `MODEL_API_KEY` — run any build there and read
+  the `author:` decision line.
