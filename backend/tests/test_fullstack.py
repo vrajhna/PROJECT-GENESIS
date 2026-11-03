@@ -62,6 +62,23 @@ def test_game_builds_with_canvas_and_scores(tmp_path: Path):
     assert any("game mode" in d["decision"] for d in report["decisions"])
 
 
+FLAPPY_SPEC = ("Build me a flappy bird game: tap or spacebar to flap, "
+               "pipes scroll in, score goes up for each pipe passed, "
+               "game over on hit with restart. Canvas + score board.")
+
+
+def test_flappy_builds_with_flap_and_pipes(tmp_path: Path):
+    report = build_fullstack(FLAPPY_SPEC, tmp_path / "flappy")
+    assert report["verdict"] == "VERIFIED", report
+    assert report["game"] is True
+    assert report.get("flappy") is True
+    html = (tmp_path / "flappy" / "frontend" / "index.html").read_text()
+    js = (tmp_path / "flappy" / "frontend" / "app.js").read_text()
+    assert "<canvas" in html and "/api/scores" in js
+    assert "flap" in js.lower() and "pipe" in js.lower()
+    assert any("Flappy" in d["decision"] for d in report["decisions"])
+
+
 def test_fullstack_api_end_to_end(tmp_path):
     from fastapi.testclient import TestClient
     from app.api import server as srv
