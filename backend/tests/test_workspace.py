@@ -36,6 +36,17 @@ def test_playground_runs_and_saves(tmp_path):
     assert c.get("/api/dashboard").json()["usage"]["projects"] == 1
 
 
+def test_terminal_approval_keeps_spaced_argv(tmp_path):
+    c = _client(tmp_path)
+    pid = c.post("/api/projects", json={"name": "T"}).json()["project"]["id"]
+    c.post(f"/api/projects/{pid}/policy", json={"autopilot": False})
+    req = c.post(f"/api/projects/{pid}/terminal",
+                 json={"argv": ["echo", "hello world"]}).json()
+    yes = c.post(f"/api/projects/{pid}/terminal/approve",
+                 json={"approval_id": req["approval_id"], "approved": True}).json()
+    assert yes["ok"] is True and "hello world" in yes["output"]
+
+
 def test_terminal_approval_flow(tmp_path):
     c = _client(tmp_path)
     pid = c.post("/api/projects", json={"name": "T"}).json()["project"]["id"]

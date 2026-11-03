@@ -43,6 +43,36 @@ app.add_middleware(
 )
 
 
+class _RateLimiter:
+    """In-memory sliding window. Loopback-only today, but the same box will
+    serve webstudiobhiwadi.com tomorrow — limits already enforced."""
+
+    def __init__(self, per_minute: int = 300) -> None:
+        self.per_minute = per_minute
+        self.hits: dict[str, list[float]] = {}
+
+    def allowed(self, ip: str) -> bool:
+        now = time.time()
+        window = [t for t in self.hits.get(ip, []) if now - t < 60]
+        window.append(now)
+        self.hits[ip] = window[-600:]
+        if len(self.hits) > 1000:
+            self.hits = {k: v for k, v in self.hits.items() if v and now - v[-1] < 60}
+        return len(window) <= self.per_minute
+
+
+RATE_LIMIT = _RateLimiter()
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    ip = request.client.host if request.client else "local"
+    if not RATE_LIMIT.allowed(ip):
+        return JSONResponse({"ok": False, "error": "rate limited: slow down"},
+                            status_code=429)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     request_id = f"req-{uuid.uuid4().hex[:12]}"
@@ -58,11 +88,22 @@ def err(request: Request, message: str, status: int = 400) -> JSONResponse:
                         status_code=status)
 
 
+PID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _safe_pid(pid: str) -> bool:
+    return bool(PID_RE.match(pid or ""))
+
+
 def proj_dir(pid: str) -> Path:
+    if not _safe_pid(pid):
+        raise ValueError(f"bad project id: {pid!r}")
     return DATA_DIR / "projects" / pid
 
 
 def load_project(pid: str) -> dict | None:
+    if not _safe_pid(pid):
+        return None
     meta = proj_dir(pid) / "project.json"
     if not meta.exists():
         return None
@@ -225,7 +266,7 @@ def set_key(body: KeyIn, request: Request):
 
 class DbIn(BaseModel):
     engine: str = Field(pattern="^(sqlite|postgres)$")
-    url: str = ""
+    url: str = Field(default="", max_length=2000)
 
 
 @app.get("/api/settings/database")
@@ -423,6 +464,8 @@ def download_engine():
 
 @app.get("/api/projects/{pid}/report")
 def get_report(pid: str, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
     rep = proj_dir(pid) / "report.json"
     if not rep.exists():
         return err(request, "no build yet", 404)
@@ -431,6 +474,8 @@ def get_report(pid: str, request: Request):
 
 @app.get("/api/runs/{pid}/events")
 def run_events(pid: str):
+    if load_project(pid) is None:
+        return JSONResponse({"ok": False, "error": "unknown project"}, status_code=404)
     rep = proj_dir(pid) / "report.json"
     steps = []
     if rep.exists():
@@ -615,6 +660,7 @@ def playground_run(body: RunCodeIn, request: Request):
 
 
 _gates: dict[str, ApprovalGate] = {}
+_pending_argv: dict[str, list[str]] = {}
 
 
 _SAFE_BINS = {"python3", "python", "pytest", "pip", "ls", "cat", "echo", "pwd",
@@ -680,6 +726,7 @@ def terminal_request(pid: str, body: TermIn, request: Request):
     (proj_dir(pid) / "work").mkdir(parents=True, exist_ok=True)
     item = gate.request("run_command",
                         f"argv={' '.join(body.argv)} in {pid}/work (timeout 30s, no shell, output capped)")
+    _pending_argv[item.id] = list(body.argv)
     return {"ok": True, "approval_id": item.id,
             "explanation": {
                 "what": f"Run `{' '.join(body.argv)}` in this project's folder.",
@@ -700,13 +747,16 @@ def terminal_approve(pid: str, body: TermApprove, request: Request):
             gate.reject(body.approval_id)
         except (KeyError, ValueError):
             pass
+        _pending_argv.pop(body.approval_id, None)
         return {"ok": False, "error": "rejected by user"}
     try:
         item = gate.approve(body.approval_id)
     except (KeyError, ValueError) as e:
         return err(request, f"bad approval id: {e}", 400)
-    m = re.match(r"argv=(.*?) in .*?/work", item.detail)
-    argv = (m.group(1) if m else "").split(" ")
+    argv = _pending_argv.pop(body.approval_id, None)
+    if argv is None:
+        m = re.match(r"argv=(.*?) in .*?/work", item.detail)
+        argv = (m.group(1) if m else "").split(" ")
     res = _exec_terminal(pid, argv)
     if res.get("error", "").startswith("command not found"):
         return err(request, res["error"], 400)

@@ -86,6 +86,11 @@ class ExperimentRunner:
                                         baseline_passed=base_n, candidate_passed=0,
                                         reason="patch must match exactly once in isolation")
             target.write_text(text.replace(find, replace, 1), encoding="utf-8")
+            # Drop bytecode cached by the baseline run: pyc headers record
+            # mtime at 1-second granularity, so a same-second, same-size
+            # patch would otherwise execute stale bytecode and the candidate
+            # would be mistested against the pre-patch code.
+            shutil.rmtree(iso / "__pycache__", ignore_errors=True)
             cand_ok, cand_n, cand_tail = _run_pytest(iso)
         evidence = [f"baseline: {'PASS' if base_ok else 'FAIL'} ({base_n} passed): {base_tail}",
                     f"candidate: {'PASS' if cand_ok else 'FAIL'} ({cand_n} passed): {cand_tail}"]

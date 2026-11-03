@@ -23,6 +23,42 @@ def test_zip_roundtrip_and_inspect(tmp_path: Path):
     assert any("a.py" in f for f in inspect_tree(dest))
 
 
+def test_make_zip_never_follows_symlinks(tmp_path: Path):
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "ok.py").write_text("print('hi')\n")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("server-local secret\n")
+    (src / "leak.py").symlink_to(outside)
+    names = zipfile.ZipFile(io.BytesIO(make_zip(src))).namelist()
+    assert "ok.py" in names and "leak.py" not in names
+    assert "server-local secret" not in str(names)
+
+
+def test_rate_limiter_blocks_bursts_but_not_neighbors():
+    from app.api.server import _RateLimiter
+    rl = _RateLimiter(per_minute=3)
+    assert [rl.allowed("1.2.3.4") for _ in range(3)] == [True, True, True]
+    assert rl.allowed("1.2.3.4") is False
+    assert rl.allowed("5.6.7.8") is True
+
+
+def test_pid_traversal_rejected(tmp_path):
+    from fastapi.testclient import TestClient
+    from app.api import server as srv
+    srv.DATA_DIR = tmp_path / "data"
+    c = TestClient(srv.app)
+    for r in (c.get("/api/projects/../report"),
+              c.get("/api/runs/../events"),
+              c.get("/api/projects/../tree"),
+              c.post("/api/projects/../terminal", json={"argv": ["echo", "hi"]})):
+        assert r.status_code == 404, (r.status_code, r.text[:200])
+    import pytest
+    with pytest.raises(ValueError):
+        srv.proj_dir("..")
+    assert srv.load_project("..") is None
+
+
 def test_zip_slip_and_bombs_rejected(tmp_path: Path):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:

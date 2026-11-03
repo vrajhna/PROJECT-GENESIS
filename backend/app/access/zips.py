@@ -43,6 +43,8 @@ def make_zip(source: Path, extra: dict[str, str] | None = None) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(source.rglob("*")):
+            if path.is_symlink():
+                continue  # never follow links out of the project
             if not path.is_file():
                 continue
             if any(part in (".venv", "__pycache__", ".git", ".pytest_cache", ".genesis")
