@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""genesis — the Project GENESIS terminal client (Linux, macOS, Windows).
+
+Stdlib only: needs nothing but Python 3.8+. Talks to a Genesis server
+(local or hosted). Point it with GENESIS_URL (default http://127.0.0.1:8000).
+
+    genesis new "Build me a website for my clothing business"
+    genesis questions <id>
+    genesis build <id> [--db sqlite|postgres] [--cache none|redis] [--payments none|stripe-test|razorpay-test]
+    genesis download <id> [out.zip]
+    genesis chat <id> "add a contact page"
+    genesis status        # engine + models backing this terminal
+    genesis serve         # start a local server (needs the engine pack)
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("GENESIS_URL", "http://127.0.0.1:8000")
+
+
+def _req(method, path, body=None, timeout=900):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode() or "{}"
+            return r.status, json.loads(raw)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode() or "{}")
+        except ValueError:
+            return e.code, {"ok": False, "error": "http error"}
+    except OSError as e:
+        return 0, {"ok": False,
+                   "error": f"cannot reach {BASE}: {e}. Start the server or set GENESIS_URL."}
+
+
+def _fail(payload, status):
+    print(f"error [{status}]: {payload.get('error', 'unknown')}")
+    return 1
+
+
+def cmd_new(args):
+    status, proj = _req("POST", "/api/projects", {"name": args.name or args.spec[:40]})
+    if not proj.get("ok"):
+        return _fail(proj, status)
+    pid = proj["project"]["id"]
+    status, spec = _req("POST", f"/api/projects/{pid}/spec", {"spec": args.spec})
+    if not spec.get("ok"):
+        return _fail(spec, status)
+    if spec.get("needs_clarification"):
+        print(f"project: {pid}\ngenesis asks: {spec.get('question')}")
+        return 0
+    print(f"project: {pid}")
+    for r in spec.get("requirements", []):
+        print(f"  [{r['id']}] {r['description']}")
+    print(f"next: genesis questions {pid}  |  genesis build {pid}")
+    return 0
+
+
+def cmd_questions(args):
+    status, data = _req("GET", f"/api/projects/{args.id}/questions")
+    if not data.get("ok"):
+        return _fail(data, status)
+    for q in data["questions"]:
+        print(f"{q['id']}: {q['ask']}")
+        for o in q["options"]:
+            mark = " (recommended)" if o["value"] == q["recommended"] else ""
+            print(f"    {o['value']}{mark} — {o['note']}")
+    return 0
+
+
+def cmd_build(args):
+    answers = {"db": args.db, "cache": args.cache, "payments": args.payments}
+    status, data = _req("POST", f"/api/projects/{args.id}/fullstack", {"answers": answers})
+    if not data.get("ok", False) and "report" not in data:
+        return _fail(data, status)
+    rep = data["report"]
+    print(f"verdict: {rep['verdict']}\nreason: {rep.get('reason', '')}")
+    for s in rep.get("steps", []):
+        print(f"  [{'ok' if s['ok'] else 'FAIL'}] {s['step']}: {s.get('detail', '')}")
+    if rep.get("preview_url"):
+        print(f"preview: {rep['preview_url']}")
+    return 0 if rep["verdict"] == "VERIFIED" else 1
+
+
+def cmd_download(args):
+    req = urllib.request.Request(f"{BASE}/api/projects/{args.id}/download")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            blob = r.read()
+    except OSError as e:
+        print(f"error: cannot reach {BASE}: {e}")
+        return 1
+    out = args.out or f"genesis-{args.id}.zip"
+    with open(out, "wb") as f:
+        f.write(blob)
+    print(f"saved {out} ({len(blob)} bytes). unzip, then follow SETUP.md.")
+    return 0
+
+
+def cmd_chat(args):
+    status, data = _req("POST", f"/api/projects/{args.id}/chat", {"message": args.message})
+    if not data.get("ok", False) and "reply" not in data:
+        return _fail(data, status)
+    print(data.get("reply", ""))
+    return 0
+
+
+def cmd_status(args):
+    status, data = _req("GET", "/api/intelligence/status", timeout=30)
+    if not data.get("ok"):
+        return _fail(data, status)
+    m = data["models"]
+    print(f"server: {BASE}")
+    print(f"models: primary={m['primary']} advanced={m['advanced']} "
+          f"key={'configured' if m['key_configured'] else 'missing'}")
+    print(f"agents: {', '.join(data['agents'])}")
+    print(f"tools: {data['tools']['count']} ({', '.join(data['tools']['names'][:8])}…)")
+    print(f"skills: {data['skills']['count']} verified reusable")
+    return 0
+
+
+def _multipart(zip_path):
+    import uuid as _uuid
+    boundary = "genesis" + _uuid.uuid4().hex
+    with open(zip_path, "rb") as f:
+        blob = f.read()
+    head = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+            f'filename="{os.path.basename(zip_path)}"\r\n'
+            f'Content-Type: application/zip\r\n\r\n').encode()
+    return head + blob + f"\r\n--{boundary}--\r\n".encode(), boundary
+
+
+def cmd_auto(args):
+    status, proj = _req("POST", "/api/projects", {"name": args.name or args.spec[:40]})
+    if not proj.get("ok"):
+        return _fail(proj, status)
+    pid = proj["project"]["id"]
+    print(f"project: {pid} — autopilot on, working without stopping…")
+    status, spec = _req("POST", f"/api/projects/{pid}/spec", {"spec": args.spec})
+    if not spec.get("ok"):
+        return _fail(spec, status)
+    if spec.get("needs_clarification"):
+        print(f"genesis needs one answer first: {spec.get('question')}")
+        return 1
+    print(f"understood: {len(spec.get('requirements', []))} requirements.")
+    status, data = _req("POST", f"/api/projects/{pid}/fullstack", {"answers": {}})
+    if not data.get("ok", False) and "report" not in data:
+        return _fail(data, status)
+    rep = data["report"]
+    for s in rep.get("steps", []):
+        print(f"  [{'ok' if s['ok'] else 'FAIL'}] {s['step']}: {s.get('detail', '')}")
+    if rep["verdict"] != "VERIFIED":
+        print(f"stopped: {rep.get('reason', '')}")
+        return 1
+    out = args.out or f"genesis-{pid}.zip"
+    req = urllib.request.Request(f"{BASE}/api/projects/{pid}/download")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            blob = r.read()
+    except OSError as e:
+        print(f"built but download failed: {e}")
+        return 1
+    with open(out, "wb") as f:
+        f.write(blob)
+    print(f"VERIFIED. preview: {rep.get('preview_url', '')}\nshipped: {out} ({len(blob)} bytes)")
+    return 0
+
+
+def cmd_upload(args):
+    if not os.path.isfile(args.zip):
+        print(f"error: no such file: {args.zip}")
+        return 1
+    name = args.name or os.path.splitext(os.path.basename(args.zip))[0]
+    status, proj = _req("POST", "/api/projects", {"name": name})
+    if not proj.get("ok"):
+        return _fail(proj, status)
+    pid = proj["project"]["id"]
+    body, boundary = _multipart(args.zip)
+    req = urllib.request.Request(f"{BASE}/api/projects/{pid}/upload", data=body, method="POST",
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            up = json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        return _fail({"error": e.read().decode()[:200]}, e.code)
+    except OSError as e:
+        print(f"error: cannot reach {BASE}: {e}")
+        return 1
+    print(f"project: {pid} — uploaded: {up}")
+    status, tree = _req("GET", f"/api/projects/{pid}/tree", timeout=30)
+    files = (tree.get("files") or []) if isinstance(tree, dict) else []
+    print(f"inspected {len(files)} paths. next: describe the change, then genesis build {pid}")
+    return 0
+
+
+def cmd_policy(args):
+    status, data = _req("POST", f"/api/projects/{args.id}/policy",
+                        {"autopilot": args.mode == "on"})
+    if not data.get("ok"):
+        return _fail(data, status)
+    print(f"autopilot: {'on' if data['policy']['autopilot'] else 'off'}")
+    return 0
+
+
+def cmd_serve(args):
+    home = os.environ.get("GENESIS_HOME", "")
+    server_mod = None
+    for cand in ([os.path.join(home, "backend")] if home else []) + ["backend", "."]:
+        init = os.path.join(cand, "app", "api", "server.py")
+        if os.path.isfile(os.path.join(cand, "app", "api", "server.py")):
+            server_mod = cand
+            break
+    if server_mod is None:
+        print("engine pack not found here. download it:\n"
+              f"  {BASE}/api/download/engine\n"
+              "unzip, set GENESIS_HOME to it, then run: genesis serve\n"
+              "(needs: pip install fastapi uvicorn)")
+        return 1
+    print(f"serving local engine from {os.path.abspath(server_mod)} on 127.0.0.1:8000 …")
+    return subprocess.call([sys.executable, "-m", "uvicorn", "app.api.server:app",
+                            "--port", "8000", "--host", "127.0.0.1"], cwd=server_mod)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="genesis", description="Project GENESIS terminal client")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("new", help="start a project from one sentence")
+    s.add_argument("spec", help="what to build, in plain words")
+    s.add_argument("--name", default="", help="project name")
+    s.set_defaults(fn=cmd_new)
+    s = sub.add_parser("questions", help="show the stack choices for a project")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_questions)
+    s = sub.add_parser("build", help="build, run, test, verify the full app")
+    s.add_argument("id")
+    s.add_argument("--db", default="sqlite", choices=["sqlite", "postgres"])
+    s.add_argument("--cache", default="none", choices=["none", "redis"])
+    s.add_argument("--payments", default="none", choices=["none", "stripe-test", "razorpay-test"])
+    s.set_defaults(fn=cmd_build)
+    s = sub.add_parser("download", help="download the project as a zip")
+    s.add_argument("id")
+    s.add_argument("out", nargs="?")
+    s.set_defaults(fn=cmd_download)
+    s = sub.add_parser("chat", help="ask genesis about the project")
+    s.add_argument("id")
+    s.add_argument("message")
+    s.set_defaults(fn=cmd_chat)
+    s = sub.add_parser("status", help="show the engine backing this terminal")
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("auto", help="one shot: new + build + download, no stops")
+    s.add_argument("spec", help="what to build, in plain words")
+    s.add_argument("--name", default="", help="project name")
+    s.add_argument("--out", default="", help="zip filename")
+    s.set_defaults(fn=cmd_auto)
+    s = sub.add_parser("upload", help="improve existing code: upload a zip as a project")
+    s.add_argument("zip", help="path to the .zip")
+    s.add_argument("--name", default="", help="project name")
+    s.set_defaults(fn=cmd_upload)
+    s = sub.add_parser("policy", help="flip autopilot for a project")
+    s.add_argument("id")
+    s.add_argument("mode", choices=["on", "off"])
+    s.set_defaults(fn=cmd_policy)
+    s = sub.add_parser("serve", help="start a local engine server")
+    s.set_defaults(fn=cmd_serve)
+    args = p.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

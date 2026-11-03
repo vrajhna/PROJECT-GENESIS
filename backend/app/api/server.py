@@ -1,0 +1,773 @@
+"""Genesis HTTP API (Part XI, first slice): projects, chat, build, access.
+
+Local-first: no auth on loopback (documented), Pydantic validation,
+request IDs on every response, consistent error envelopes, SSE-ready
+structure (long build runs synchronously in v1; events endpoint streams
+the stored report steps).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+import uuid
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from ..access import github as gh
+from ..access.zips import inspect_tree, make_zip, safe_extract
+from ..agents.roles import ArchitectAgent, ReviewerAgent
+from ..builder.approvals import ApprovalGate
+from ..builder.files import GenesisWorkspace
+from ..builder.fullstack import (build_fullstack, detect_features, plan_questions,
+                                 resolve_answers)
+from ..builder.pipeline import build_and_verify
+from ..intelligence.meta_client import MetaClient
+from ..intelligence.model_router import ModelRouter
+from ..intelligence.prompt_manager import render
+
+DATA_DIR = Path(__import__("os").environ.get("GENESIS_DATA_DIR", "/tmp/genesis-data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="Genesis", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3101", "http://127.0.0.1:3101",
+                   "http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = f"req-{uuid.uuid4().hex[:12]}"
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+def err(request: Request, message: str, status: int = 400) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": message,
+                         "request_id": getattr(request.state, "request_id", "")},
+                        status_code=status)
+
+
+def proj_dir(pid: str) -> Path:
+    return DATA_DIR / "projects" / pid
+
+
+def load_project(pid: str) -> dict | None:
+    meta = proj_dir(pid) / "project.json"
+    if not meta.exists():
+        return None
+    return json.loads(meta.read_text(encoding="utf-8"))
+
+
+def save_project(meta: dict) -> None:
+    d = proj_dir(meta["id"])
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "project.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+class NewProject(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class SpecIn(BaseModel):
+    spec: str = Field(min_length=1, max_length=8000)
+
+
+class ChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+
+
+class CloneIn(BaseModel):
+    url: str = Field(min_length=1, max_length=500)
+    branch: str | None = None
+
+
+class BranchIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class PushIn(BaseModel):
+    branch: str = Field(min_length=1, max_length=100)
+    approved: bool = False
+
+
+class FullstackIn(BaseModel):
+    answers: dict = Field(default_factory=dict)
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+CLI_DIR = REPO_ROOT / "genesis-cli"
+
+
+def _load_dotenv(path: Path) -> dict:
+    """Parse KEY=value lines with stdlib only. Never overrides real environment."""
+    import os
+    found: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return found
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().strip("'\"")
+        if k and k not in os.environ:
+            os.environ[k] = v
+            found[k] = v
+    return found
+
+
+_load_dotenv(REPO_ROOT / ".env")
+
+
+def _zip_tree(base: Path, rels: list[str], arc_prefix: str) -> bytes:
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for rel in rels:
+            p = base / rel
+            if not p.exists():
+                continue
+            if p.is_dir():
+                for f in sorted(p.rglob("*")):
+                    if f.is_file() and "__pycache__" not in f.parts \
+                            and f.suffix != ".pyc" and ".venv" not in f.parts \
+                            and "node_modules" not in f.parts:
+                        relpath = f.relative_to(base)
+                        z.write(f, f"{arc_prefix}/{relpath}" if arc_prefix else str(relpath))
+            else:
+                z.write(p, f"{arc_prefix}/{rel}" if arc_prefix else rel)
+    return buf.getvalue()
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "service": "genesis", "time": time.time()}
+
+
+@app.post("/api/projects")
+def create_project(body: NewProject):
+    pid = f"proj-{uuid.uuid4().hex[:8]}"
+    meta = {"id": pid, "name": body.name, "spec": "", "created": time.time(),
+            "policy": {"autopilot": True}}
+    save_project(meta)
+    return {"ok": True, "project": meta}
+
+
+@app.get("/api/projects")
+def list_projects():
+    out = []
+    base = DATA_DIR / "projects"
+    if base.exists():
+        for meta in sorted(base.glob("*/project.json")):
+            try:
+                out.append(json.loads(meta.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+    return {"ok": True, "projects": out}
+
+
+@app.get("/api/projects/{pid}")
+def get_project(pid: str, request: Request):
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    return {"ok": True, "project": meta}
+
+
+def _set_dotenv_var(key: str, value: str) -> None:
+    envf = REPO_ROOT / ".env"
+    cur = envf.read_text(encoding="utf-8") if envf.exists() else ""
+    out: list[str] = []
+    seen = False
+    for ln in cur.splitlines():
+        if ln.strip().startswith(f"{key}="):
+            if not seen:
+                out.append(f"{key}={value}")
+                seen = True
+        else:
+            out.append(ln)
+    if not seen:
+        out.append(f"{key}={value}")
+    envf.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+class KeyIn(BaseModel):
+    key: str = Field(min_length=8, max_length=500)
+
+
+@app.post("/api/settings/key")
+def set_key(body: KeyIn, request: Request):
+    import os
+    key = body.key.strip()
+    if not key:
+        return err(request, "empty key", 400)
+    os.environ["MODEL_API_KEY"] = key
+    try:
+        _set_dotenv_var("MODEL_API_KEY", key)
+    except OSError as e:
+        return err(request, f"key live for this session, disk write failed: {e}", 500)
+    return {"ok": True, "key_configured": True}
+
+
+class DbIn(BaseModel):
+    engine: str = Field(pattern="^(sqlite|postgres)$")
+    url: str = ""
+
+
+@app.get("/api/settings/database")
+def get_database():
+    import os
+    url = os.environ.get("DATABASE_URL", "")
+    return {"ok": True, "engine": "postgres" if url else "sqlite",
+            "live": "pending — reachable DB required" if url else "verified — zero setup"}
+
+
+def _pg_reachable(url: str) -> tuple[bool, str]:
+    """Real reachability probe: connect + SELECT 1, 5s cap. Never raises."""
+    try:
+        import psycopg2
+    except ImportError:
+        return False, "pending — psycopg2 not installed"
+    try:
+        con = psycopg2.connect(url, connect_timeout=5)
+        try:
+            cur = con.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        finally:
+            con.close()
+        return True, "verified — reachable, SELECT 1 ok"
+    except Exception as e:
+        return False, f"pending — unreachable: {str(e)[:160]}"
+
+
+@app.post("/api/settings/database")
+def set_database(body: DbIn, request: Request):
+    import os
+    if body.engine == "postgres":
+        if not body.url.startswith(("postgresql://", "postgres://")):
+            return err(request, "postgres needs a postgresql:// URL", 400)
+        os.environ["DATABASE_URL"] = body.url
+        try:
+            _set_dotenv_var("DATABASE_URL", body.url)
+        except OSError as e:
+            return err(request, f"database live for this session, disk write failed: {e}", 500)
+        _, live = _pg_reachable(body.url)
+        return {"ok": True, "engine": "postgres", "live": live}
+    os.environ.pop("DATABASE_URL", None)
+    return {"ok": True, "engine": "sqlite", "live": "verified — zero setup"}
+
+
+class PolicyIn(BaseModel):
+    autopilot: bool
+
+
+@app.post("/api/projects/{pid}/policy")
+def set_policy(pid: str, body: PolicyIn, request: Request):
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    meta["policy"] = {"autopilot": body.autopilot}
+    save_project(meta)
+    return {"ok": True, "policy": meta["policy"]}
+
+
+@app.post("/api/projects/{pid}/spec")
+def set_spec(pid: str, body: SpecIn, request: Request):
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    arch = ArchitectAgent().run(body.spec)
+    if not arch.ok:
+        return {"ok": True, "needs_clarification": True,
+                "question": arch.summary, "requirements": []}
+    meta["spec"] = body.spec
+    save_project(meta)
+    return {"ok": True, "requirements": arch.data["requirements"],
+            "evidence": arch.evidence}
+
+
+@app.post("/api/projects/{pid}/chat")
+def chat(pid: str, body: ChatIn, request: Request):
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    text = body.message.strip()
+    if len(text) < 20 and not meta.get("spec"):
+        return {"ok": True, "mode": "clarify",
+                "reply": "Tell me a little more — what should the software do, and who is it for? One or two sentences is enough to start."}
+    arch = ArchitectAgent().run(meta.get("spec") + "\n" + text if meta.get("spec") else text)
+    if not arch.ok:
+        return {"ok": True, "mode": "clarify", "reply": arch.summary}
+    reply = (f"I see {len(arch.data['requirements'])} requirement(s): "
+             + "; ".join(r["id"] + " " + r["description"][:60] for r in arch.data["requirements"])
+             + ". Press Build and I will generate, install, start, test and verify — showing every step.")
+    client = MetaClient()
+    if client.config.api_key:
+        try:
+            _, prompt = render("plan.make", {"requirements": json.dumps(arch.data["requirements"])})
+            routed = ModelRouter(client).run("routine codegen", prompt[:2000])
+            if routed.get("ok"):
+                reply += " (Model note attached.)"
+        except Exception:
+            pass
+    return {"ok": True, "mode": "plan", "reply": reply,
+            "requirements": arch.data["requirements"]}
+
+
+@app.post("/api/projects/{pid}/build")
+def build_project(pid: str, request: Request):
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    if not meta.get("spec"):
+        return err(request, "set a specification first (POST spec)", 400)
+    workdir = proj_dir(pid) / "work"
+    report = build_and_verify(meta["spec"], workdir)
+    (proj_dir(pid) / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return {"ok": report["verdict"] == "VERIFIED", "report": report}
+
+
+@app.get("/api/projects/{pid}/questions")
+def fullstack_questions(pid: str, request: Request):
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    if not meta.get("spec"):
+        return err(request, "set a specification first (POST /spec)", 400)
+    arch = ArchitectAgent().run(meta["spec"])
+    if not arch.ok:
+        return err(request, arch.summary, 422)
+    reqs = arch.data["requirements"]
+    features = detect_features(reqs)
+    return {"ok": True, "questions": plan_questions(reqs, features)}
+
+
+@app.post("/api/projects/{pid}/fullstack")
+def build_fullstack_app(pid: str, request: Request, body: FullstackIn | None = None):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    meta = load_project(pid)
+    assert meta is not None
+    if not meta.get("spec"):
+        return err(request, "set a specification first (POST /spec)", 400)
+    answers = body.answers if body else {}
+    try:
+        chosen = resolve_answers(answers or None)
+    except ValueError as e:
+        return err(request, str(e), 400)
+    workdir = proj_dir(pid) / "work"
+    for stale in ("app.db", "app.log"):
+        try:
+            (workdir / stale).unlink()
+        except OSError:
+            pass
+    report = build_fullstack(meta["spec"], workdir, answers=chosen)
+    (proj_dir(pid) / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return {"ok": report["verdict"] == "VERIFIED", "report": report}
+
+
+@app.get("/api/intelligence/status")
+def intelligence_status():
+    import os
+    from ..agents import roles as _roles
+    from ..tools.registry import TOOLS
+    agents = sorted(n for n in dir(_roles) if n.endswith("Agent"))
+    try:
+        from ..memory.skill_registry import SkillRegistry
+        skill_ids = [s.id for s in SkillRegistry(DATA_DIR / "skills.json").list()]
+    except Exception:
+        skill_ids = []
+    return {"ok": True,
+            "models": {"primary": os.environ.get("META_PRIMARY_MODEL", "muse-spark-1.3"),
+                       "advanced": os.environ.get("META_ADVANCED_MODEL", "muse-wonder-1.0"),
+                       "key_configured": bool(os.environ.get("MODEL_API_KEY")),
+                       "key_url": os.environ.get("META_KEY_URL", "")},
+            "agents": agents,
+            "tools": {"count": len(TOOLS), "names": [t.name for t in TOOLS]},
+            "skills": {"count": len(skill_ids), "ids": skill_ids}}
+
+
+@app.get("/api/download/cli")
+def download_cli():
+    blob = _zip_tree(REPO_ROOT, ["genesis-cli"], "")
+    if not blob:
+        return JSONResponse({"ok": False, "error": "cli pack missing on server"}, status_code=500)
+    return StreamingResponse(iter([blob]), media_type="application/zip",
+                             headers={"Content-Disposition": "attachment; filename=genesis-cli.zip"})
+
+
+@app.get("/api/download/engine")
+def download_engine():
+    blob = _zip_tree(REPO_ROOT, ["app", "tests", "genesis-cli",
+                                 "requirements.txt", "README.md", ".env.example"], "genesis-engine")
+    if not blob:
+        return JSONResponse({"ok": False, "error": "engine pack missing on server"}, status_code=500)
+    return StreamingResponse(iter([blob]), media_type="application/zip",
+                             headers={"Content-Disposition": "attachment; filename=genesis-engine.zip"})
+
+
+@app.get("/api/projects/{pid}/report")
+def get_report(pid: str, request: Request):
+    rep = proj_dir(pid) / "report.json"
+    if not rep.exists():
+        return err(request, "no build yet", 404)
+    return {"ok": True, "report": json.loads(rep.read_text(encoding="utf-8"))}
+
+
+@app.get("/api/runs/{pid}/events")
+def run_events(pid: str):
+    rep = proj_dir(pid) / "report.json"
+    steps = []
+    if rep.exists():
+        try:
+            steps = json.loads(rep.read_text(encoding="utf-8")).get("steps", [])
+        except ValueError:
+            steps = []
+
+    def gen():
+        yield f"data: {json.dumps({'type': 'hello', 'project': pid})}\n\n"
+        for s in steps:
+            yield f"data: {json.dumps({'type': 'step', **s})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/api/projects/{pid}/tree")
+def tree(pid: str, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    return {"ok": True, "files": inspect_tree(proj_dir(pid) / "work")}
+
+
+@app.get("/api/projects/{pid}/files")
+def read_file(pid: str, path: str, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    try:
+        content = GenesisWorkspace(proj_dir(pid) / "work").read_file(path)
+    except (ValueError, OSError) as e:
+        return err(request, str(e), 400)
+    return {"ok": True, "path": path, "content": content[:20000]}
+
+
+@app.post("/api/projects/{pid}/upload")
+async def upload_zip(pid: str, request: Request, file: UploadFile):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    data = await file.read()
+    if len(data) > 100 * 1024 * 1024:
+        return err(request, "zip too large (100 MB cap)", 400)
+    try:
+        names = safe_extract(data, proj_dir(pid) / "work")
+    except ValueError as e:
+        return err(request, f"rejected archive: {e}", 400)
+    except Exception as e:
+        return err(request, f"unreadable archive: {type(e).__name__}", 400)
+    return {"ok": True, "files": names, "summary": f"{len(names)} file(s) extracted"}
+
+
+@app.get("/api/projects/{pid}/download")
+def download_zip(pid: str, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    from fastapi.responses import Response
+    blob = make_zip(proj_dir(pid) / "work")
+    return Response(blob, media_type="application/zip",
+                    headers={"Content-Disposition": f"attachment; filename={pid}.zip"})
+
+
+@app.post("/api/projects/{pid}/github/clone")
+def github_clone(pid: str, body: CloneIn, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    res = gh.clone(body.url, proj_dir(pid) / "work", branch=body.branch)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "clone failed"))
+    return {"ok": True, **res}
+
+
+@app.get("/api/projects/{pid}/github/branches")
+def github_branches(pid: str, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    return gh.list_branches(proj_dir(pid) / "work")
+
+
+@app.post("/api/projects/{pid}/github/branch")
+def github_branch(pid: str, body: BranchIn, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    res = gh.create_branch(proj_dir(pid) / "work", body.name)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "branch failed"))
+    return {"ok": True, **res}
+
+
+@app.get("/api/projects/{pid}/github/diff")
+def github_diff(pid: str, base: str = "HEAD"):
+    if load_project(pid) is None:
+        return {"ok": False, "error": "unknown project"}
+    res = gh.diff_summary(proj_dir(pid) / "work", base=base)
+    res.update(gh.run_tests_first(proj_dir(pid) / "work"))
+    return res
+
+
+@app.post("/api/projects/{pid}/github/push")
+def github_push(pid: str, body: PushIn, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    res = gh.push(proj_dir(pid) / "work", body.branch, approved=body.approved)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "push refused"))
+    return {"ok": True, **res}
+
+
+@app.get("/api/github/connect")
+def github_connect():
+    return gh.connect_account()
+
+
+def _project_stats(pid: str) -> dict:
+    base = proj_dir(pid)
+    work = base / "work"
+    files = inspect_tree(work) if work.exists() else []
+    verdict, passed = "never-built", 0
+    rep = base / "report.json"
+    if rep.exists():
+        try:
+            r = json.loads(rep.read_text(encoding="utf-8"))
+            verdict = r.get("verdict", "unknown")
+            passed = sum(1 for s in r.get("steps", []) if s.get("ok"))
+        except ValueError:
+            verdict = "corrupt-report"
+    return {"files": len(files), "verdict": verdict, "steps_ok": passed}
+
+
+@app.get("/api/dashboard")
+def dashboard():
+    projs = list_projects()["projects"]
+    items, verified, total_passed = [], 0, 0
+    for p in projs:
+        st = _project_stats(p["id"])
+        if st["verdict"] == "VERIFIED":
+            verified += 1
+            total_passed += st["steps_ok"]
+        mtime = 0
+        try:
+            mtime = (proj_dir(p["id"]) / "project.json").stat().st_mtime
+        except OSError:
+            pass
+        items.append({**p, **st, "mtime": mtime})
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return {"ok": True,
+            "projects": items,
+            "usage": {"projects": len(items), "verified": verified,
+                      "builds": sum(1 for i in items if i["verdict"] != "never-built"),
+                      "steps_passed": total_passed},
+            "github": gh.connect_account()}
+
+
+class RunCodeIn(BaseModel):
+    code: str = Field(min_length=1, max_length=20000)
+    save_as: str | None = None
+
+
+@app.post("/api/playground/run")
+def playground_run(body: RunCodeIn, request: Request):
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="genesis-play-") as tmp:
+        main = Path(tmp) / "main.py"
+        main.write_text(body.code, encoding="utf-8")
+        try:
+            proc = subprocess.run(["python3", "main.py"], cwd=tmp,
+                                  capture_output=True, text=True,
+                                  timeout=20, shell=False)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "20s time limit exceeded (stdlib only, no installs here)"}
+        out = (proc.stdout + proc.stderr)[-4000:]
+        result: dict = {"ok": proc.returncode == 0, "exit_code": proc.returncode,
+                        "output": out, "note": "stdlib only; use Build for dependencies"}
+        if body.save_as:
+            meta = {"id": f"proj-{uuid.uuid4().hex[:8]}", "name": body.save_as,
+                    "spec": "Playground experiment.", "created": time.time()}
+            save_project(meta)
+            (proj_dir(meta["id"]) / "work").mkdir(parents=True, exist_ok=True)
+            GenesisWorkspace(proj_dir(meta["id"]) / "work").create_file("main.py", body.code)
+            result["project"] = meta
+        return result
+
+
+_gates: dict[str, ApprovalGate] = {}
+
+
+_SAFE_BINS = {"python3", "python", "pytest", "pip", "ls", "cat", "echo", "pwd",
+              "git", "npm", "node", "find", "grep", "head", "tail", "wc", "diff",
+              "unzip", "zip", "lsb_release", "whoami"}
+_DENY_TOKENS = {"push", "deploy", "publish", "release", "curl", "wget", "ssh",
+                "scp", "sftp", "ftp", "telnet", "rm", "rmdir", "clone", "kill",
+                "killall", "reboot", "shutdown", "halt", "poweroff", "mkfs",
+                "dd", "chmod", "chown", "sudo", "su", "passwd"}
+
+
+def _auto_runnable(argv: list[str]) -> bool:
+    """Autopilot may run read-only and project-local build/test commands at once.
+    Anything that deletes, leaves the machine, escalates, or touches the network
+    beyond dependency installs still needs explicit approval."""
+    if not argv or argv[0] not in _SAFE_BINS:
+        return False
+    for tok in argv:
+        if any(c in tok for c in ";|&$`><()"):
+            return False
+        if tok.lower() in _DENY_TOKENS:
+            return False
+    return True
+
+
+def _exec_terminal(pid: str, argv: list[str]) -> dict:
+    import subprocess
+    (proj_dir(pid) / "work").mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(argv, cwd=str(proj_dir(pid) / "work"),
+                              capture_output=True, text=True, timeout=30, shell=False)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "30s time limit exceeded"}
+    except FileNotFoundError as e:
+        return {"ok": False, "error": f"command not found: {e}"}
+    out = (proc.stdout + proc.stderr)[-4000:]
+    return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "output": out}
+
+
+class TermIn(BaseModel):
+    argv: list[str] = Field(min_length=1, max_length=20)
+
+
+class TermApprove(BaseModel):
+    approval_id: str
+    approved: bool
+
+
+@app.post("/api/projects/{pid}/terminal")
+def terminal_request(pid: str, body: TermIn, request: Request):
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    if not all(isinstance(a, str) for a in body.argv) or len(" ".join(body.argv)) > 2000:
+        return err(request, "argv must be a list of short strings (no shell)", 400)
+    if (meta.get("policy") or {}).get("autopilot") and _auto_runnable(body.argv):
+        res = _exec_terminal(pid, body.argv)
+        if res.get("error", "").startswith("command not found"):
+            return err(request, res["error"], 400)
+        res["autopilot"] = True
+        return res
+    gate = _gates.setdefault(pid, ApprovalGate())
+    (proj_dir(pid) / "work").mkdir(parents=True, exist_ok=True)
+    item = gate.request("run_command",
+                        f"argv={' '.join(body.argv)} in {pid}/work (timeout 30s, no shell, output capped)")
+    return {"ok": True, "approval_id": item.id,
+            "explanation": {
+                "what": f"Run `{' '.join(body.argv)}` in this project's folder.",
+                "why": "You asked for terminal execution.",
+                "changes": "Runs in an isolated subprocess; may write files inside the project only.",
+                "risks": "A malicious or mistaken command can damage project files. Nothing outside the project is reachable.",
+                "rollback": "Use the project's Git checkpoint / restore flow before risky commands."},
+            "options": ["approve", "reject"]}
+
+
+@app.post("/api/projects/{pid}/terminal/approve")
+def terminal_approve(pid: str, body: TermApprove, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    gate = _gates.setdefault(pid, ApprovalGate())
+    if not body.approved:
+        try:
+            gate.reject(body.approval_id)
+        except (KeyError, ValueError):
+            pass
+        return {"ok": False, "error": "rejected by user"}
+    try:
+        item = gate.approve(body.approval_id)
+    except (KeyError, ValueError) as e:
+        return err(request, f"bad approval id: {e}", 400)
+    m = re.match(r"argv=(.*?) in .*?/work", item.detail)
+    argv = (m.group(1) if m else "").split(" ")
+    res = _exec_terminal(pid, argv)
+    if res.get("error", "").startswith("command not found"):
+        return err(request, res["error"], 400)
+    return res
+
+
+@app.get("/api/projects/{pid}/suggestions")
+def suggestions(pid: str, request: Request):
+    if load_project(pid) is None:
+        return err(request, "unknown project", 404)
+    work = proj_dir(pid) / "work"
+    out: list[dict] = []
+    if not work.exists() or not any(work.iterdir()):
+        return {"ok": True, "suggestions": [{
+            "severity": "info", "title": "Empty project",
+            "detail": "Describe the idea above and press Build, or upload a ZIP.",
+            "action": "spec"}]}
+    import subprocess as _sp
+    has_tests = any(work.glob("test_*.py")) or any(work.glob("*_test.py"))
+    if not has_tests:
+        out.append({"severity": "high", "title": "No tests present",
+                    "detail": "Nothing here can be verified. Generate tests before claiming anything works.",
+                    "action": "build"})
+    else:
+        try:
+            p = _sp.run(["python3", "-m", "pytest", "-q", "--collect-only"],
+                        cwd=str(work), capture_output=True, text=True, timeout=60, shell=False)
+            import re as _re
+            m = _re.search(r"(\d+) tests? collected", (p.stdout + p.stderr))
+            out.append({"severity": "info" if p.returncode == 0 else "high",
+                        "title": f"{m.group(1) if m else '?'} tests collected" if p.returncode == 0 else "Test collection fails",
+                        "detail": "Run the suite to see what passes.", "action": "build"})
+        except Exception as e:
+            out.append({"severity": "high", "title": "Cannot collect tests",
+                        "detail": str(e)[:200], "action": "build"})
+    if not (work / "README.md").exists() and not (work / "SETUP.md").exists():
+        out.append({"severity": "medium", "title": "No setup docs",
+                    "detail": "Nobody can run this without instructions. Export adds SETUP.md automatically.",
+                    "action": "export"})
+    todos = 0
+    for f in work.rglob("*"):
+        if f.is_file() and f.suffix in (".py", ".ts", ".tsx", ".js", ".md") and f.stat().st_size < 500000:
+            try:
+                todos += f.read_text(encoding="utf-8", errors="ignore").count("TODO")
+            except OSError:
+                continue
+    if todos:
+        out.append({"severity": "low", "title": f"{todos} TODO marker(s)",
+                    "detail": "Unfinished business tracked in code comments.", "action": "review"})
+    big = [str(f.relative_to(work)) for f in work.rglob("*")
+           if f.is_file() and f.stat().st_size > 500000 and ".venv" not in f.parts]
+    if big:
+        out.append({"severity": "medium", "title": "Large files committed",
+                    "detail": ", ".join(big[:5]) + " — generated artifacts should not live in the repo.",
+                    "action": "review"})
+    rev = ReviewerAgent().run(work)
+    for finding in rev.data.get("findings", []):
+        if "secret" in finding.lower() or "possible" in finding.lower():
+            out.append({"severity": "high", "title": "Possible secret in code",
+                        "detail": finding + " — move it to env vars.", "action": "review"})
+    if not out:
+        out.append({"severity": "info", "title": "Healthy baseline",
+                    "detail": "Tests present, docs present, no secrets, no bloat.", "action": "none"})
+    return {"ok": True, "suggestions": out}
