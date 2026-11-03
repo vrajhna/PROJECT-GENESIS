@@ -11,29 +11,50 @@ def _client(tmp_path):
     return TestClient(srv.app)
 
 
-def test_dashboard_empty_then_populated(tmp_path):
+def _login(c, monkeypatch, email="t@x.co"):
+    """Real OTP flow with a fake mailer (mail delivery is faked;
+    hashing/expiry/session logic is all real)."""
+    from app.auth import accounts as acc
+    codes = {}
+    monkeypatch.setattr(acc, "send_otp_mail",
+                        lambda to, code, mailer=None: codes.__setitem__(to, code))
+    assert c.post("/api/auth/request", json={"email": email}).status_code == 200
+    r = c.post("/api/auth/verify",
+               json={"email": email, "code": codes[email], "name": "Tester"})
+    assert r.status_code == 200, r.text
+    return {"Authorization": "Bearer " + r.json()["token"]}
+
+
+def test_dashboard_empty_then_populated(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
     c = _client(tmp_path)
     d = c.get("/api/dashboard").json()
     assert d["ok"] is True and d["usage"]["projects"] == 0
     assert set(d["github"]) >= {"ok"}  # real state: True where gh/token exists
-    pid = c.post("/api/projects", json={"name": "P"}).json()["project"]["id"]
-    d2 = c.get("/api/dashboard").json()
+    h = _login(c, monkeypatch)
+    pid = c.post("/api/projects", json={"name": "P"}, headers=h).json()["project"]["id"]
+    d2 = c.get("/api/dashboard", headers=h).json()
     assert d2["usage"]["projects"] == 1
     assert d2["projects"][0]["id"] == pid
     assert d2["projects"][0]["verdict"] == "never-built"
+    # logged-out sessions still see nothing (privacy)
+    assert c.get("/api/dashboard").json()["usage"]["projects"] == 0
 
 
-def test_playground_runs_and_saves(tmp_path):
+def test_playground_runs_and_saves(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
     c = _client(tmp_path)
     r = c.post("/api/playground/run", json={"code": "print(40 + 2)"}).json()
     assert r["ok"] is True and "42" in r["output"]
     assert "stdlib only" in r["note"]
     bad = c.post("/api/playground/run", json={"code": "raise SystemExit(3)"}).json()
     assert bad["ok"] is False and bad["exit_code"] == 3
+    h = _login(c, monkeypatch, email="play@x.co")
     saved = c.post("/api/playground/run",
-                   json={"code": "print('kept')", "save_as": "Kept"}).json()
+                   json={"code": "print('kept')", "save_as": "Kept"},
+                   headers=h).json()
     assert saved["project"]["name"] == "Kept"
-    assert c.get("/api/dashboard").json()["usage"]["projects"] == 1
+    assert c.get("/api/dashboard", headers=h).json()["usage"]["projects"] == 1
 
 
 def test_terminal_approval_keeps_spaced_argv(tmp_path):

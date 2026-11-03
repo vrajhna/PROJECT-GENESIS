@@ -267,6 +267,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       const j = await r.json();
       setPid(j.project.id);
       setReport(null);
+      setPubUrl("");
       setReqs([]);
       setQuestions([]);
       setAnswers({});
@@ -356,19 +357,61 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
 
   async function fetchDashboard() {
     try {
-      setDash(await (await fetch(`${API}/api/dashboard`)).json());
+      setDash(await (await fetch(`${API}/api/dashboard`, { headers: authHeaders() })).json());
     } catch {
       /* offline */
     }
   }
 
+  async function claimProject(id: string) {
+    if (!authToken()) {
+      setAuthOpen(true);
+      return setNotice("Login first — then claim it.");
+    }
+    try {
+      const r = await fetch(`${API}/api/projects/${id}/claim`, { method: "POST", headers: authHeaders() });
+      const j = await r.json();
+      setNotice(j.ok ? "Claimed — it is yours now." : j.error || "Could not claim it.");
+      fetchDashboard();
+    } catch {
+      setNotice("Backend is offline.");
+    }
+  }
+
+  async function deleteProject(id: string, name: string) {
+    if (!authToken()) {
+      setAuthOpen(true);
+      return setNotice("Login first — then manage your projects.");
+    }
+    if (!window.confirm(`Delete "${name}" forever? This removes the project and its published page. This cannot be undone.`)) return;
+    setBusy("Deleting…");
+    try {
+      const r = await fetch(`${API}/api/projects/${id}`, { method: "DELETE", headers: authHeaders() });
+      const j = await r.json();
+      if (j.ok) {
+        if (pid === id) {
+          setPid("");
+          setReport(null);
+          setPubUrl("");
+          setFiles([]);
+        }
+        setNotice("Deleted.");
+        fetchDashboard();
+      } else setNotice(j.error || "Could not delete it.");
+    } catch {
+      setNotice("Backend is offline.");
+    }
+    setBusy("");
+  }
+
   useEffect(() => {
     fetchDashboard();
-  }, [pid, report]);
+  }, [pid, report, member]);
 
   async function openProject(id: string) {
     setPid(id);
     setReport(null);
+    setPubUrl("");
     setReqs([]);
     setQuestions([]);
     setAnswers({});
@@ -380,6 +423,9 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     try {
       const p = await (await fetch(`${API}/api/projects/${id}`)).json();
       setAuto(p.project.policy ? p.project.policy.autopilot !== false : true);
+      if (p.project && p.project.publish && p.project.publish.slug) {
+        setPubUrl(`${API}/p/${p.project.publish.slug}/`);
+      }
     } catch {
       /* offline */
     }
@@ -588,10 +634,20 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
                 <strong>{p.name}</strong> · {p.verdict} · {p.files} files{" "}
                 <button type="button" className="btn" style={{ fontSize: 12, padding: "4px 12px" }} onClick={() => openProject(p.id)}>
                   Open
+                </button>{" "}
+                {!p.owner_email && (
+                  <button type="button" className="btn" style={{ fontSize: 12, padding: "4px 12px" }} onClick={() => claimProject(p.id)}>
+                    Claim
+                  </button>
+                )}{" "}
+                <button type="button" className="btn" style={{ fontSize: 12, padding: "4px 12px" }} onClick={() => deleteProject(p.id, p.name)}>
+                  Delete
                 </button>
               </p>
             ))}
-            {dash.projects.length === 0 && <p className="prose">No projects yet — create one below.</p>}
+            {dash.projects.length === 0 && (
+              <p className="prose">{member ? "No projects yet — create one below." : "Log in above to see your projects. Nothing here is shared."}</p>
+            )}
           </>
         )}
       </section>
@@ -726,10 +782,16 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
           </p>
         )}
         {sel && <pre className="out" style={{ maxHeight: 320, overflow: "auto" }}>{code.slice(0, 8000) || "(empty)"}</pre>}
-        {report?.preview_url && (
+        {report?.preview_url && !pubUrl && (
           <div style={{ marginTop: 16 }}>
             <p className="prose"><span className="hl">live preview</span> {report.preview_url} (runs while this build lives)</p>
             <iframe src={report.preview_url} title="App preview" style={{ width: "100%", height: 320, border: "1px solid var(--line2)", borderRadius: 8, background: "#fff" }} sandbox="allow-scripts allow-same-origin" />
+          </div>
+        )}
+        {pubUrl && (
+          <div style={{ marginTop: 16 }}>
+            <p className="prose"><span className="hl">live preview</span> {pubUrl} (published — always on, play it here)</p>
+            <iframe src={pubUrl} title="Published app preview" style={{ width: "100%", height: 420, border: "1px solid var(--line2)", borderRadius: 8, background: "#fff" }} sandbox="allow-scripts allow-modals" allow="autoplay" />
           </div>
         )}
         {failed.length > 0 && (

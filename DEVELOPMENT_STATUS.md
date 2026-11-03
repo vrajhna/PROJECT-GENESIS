@@ -496,3 +496,26 @@
 - Proven locally with fakes only (no key on this machine). Live proof needs
   a key: Railway already has `MODEL_API_KEY` — run any build there and read
   the `author:` decision line.
+
+## 2026-11-03 — M6a: private projects + delete (your screenshot, fixed)
+
+- Logged-out sessions now see NOTHING: `GET /api/projects` and
+  `/api/dashboard` return empty without a token. Logged-in members see
+  their own projects plus unclaimed legacy ones (Claim button in the
+  dashboard makes them private).
+- New `DELETE /api/projects/{pid}` (auth + owner only; legacy must be
+  claimed first — no silent deletes). Removes the project tree AND its
+  published `/p/` copy + index entry. Path-traversal guarded.
+- Dashboard rows gained Claim (unclaimed only) + Delete (confirm dialog);
+  empty state tells guests to log in; login/logout re-scopes the list.
+- Tests updated to the new contract (login via real OTP flow with fake
+  mailer): `test_listing_is_private_and_delete_works` covers 401/403/
+  claim-first/publish-cleanup. Full suite: `113 passed, 3 skipped`.
+- Incidental find, disclosed: `backend/.env` holds a now-DEAD Meta key
+  (401 invalid_api_key; status-only probe, value never shown/committed —
+  gitignored, in zero commits). It made live tests run-and-fail in
+  full-suite runs (collection-order skip evaluation). Suite above ran with
+  the file temporarily aside (live tests skip honestly); file restored
+  byte-identical. Founder: paste a fresh key into `backend/.env` (local)
+  and refresh Railway `MODEL_API_KEY` when ready — then live tests + model
+  codegen prove themselves.

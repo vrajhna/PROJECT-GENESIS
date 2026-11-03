@@ -319,6 +319,43 @@ def auth_logout(request: Request):
     return {"ok": True}
 
 
+@app.delete("/api/projects/{pid}")
+def delete_project(pid: str, request: Request):
+    me = current_member(request)
+    if not me:
+        return err(request, "join first — login to delete projects", 401)
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    owner = meta.get("owner_email") or ""
+    if owner != me["email"]:
+        if not owner:
+            return err(request, "claim it first, then delete it", 403)
+        return err(request, "not yours — only the owner can delete it", 403)
+    import shutil
+    slug = (meta.get("publish") or {}).get("slug") or ""
+    if slug and SLUG_RE.match(slug):
+        try:
+            target = PUBLISH_DIR / slug
+            if target.is_dir():
+                shutil.rmtree(target)
+        except OSError:
+            pass
+        idx = _publishes_index()
+        idx.pop(slug, None)
+        _save_publishes_index(idx)
+    try:
+        target = proj_dir(pid)
+        base = (DATA_DIR / "projects").resolve()
+        if target.resolve() != base and base in target.resolve().parents:
+            shutil.rmtree(target)
+        else:
+            return err(request, "refusing to delete outside projects", 500)
+    except (OSError, ValueError) as e:
+        return err(request, f"delete failed: {e}", 500)
+    return {"ok": True, "deleted": pid}
+
+
 @app.post("/api/projects/{pid}/claim")
 def claim_project(pid: str, request: Request):
     me = current_member(request)
@@ -337,15 +374,24 @@ def claim_project(pid: str, request: Request):
 
 
 @app.get("/api/projects")
-def list_projects():
+def list_projects(request: Request):
+    """Your projects only. Logged out sees nothing; logged in sees owned
+    projects plus unclaimed legacy ones (claim them to make them yours)."""
+    me = current_member(request)
     out = []
+    if not me:
+        return {"ok": True, "projects": out}
     base = DATA_DIR / "projects"
     if base.exists():
         for meta in sorted(base.glob("*/project.json")):
             try:
-                out.append(json.loads(meta.read_text(encoding="utf-8")))
+                m = json.loads(meta.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
+            owner = m.get("owner_email") or ""
+            if owner and owner != me["email"]:
+                continue
+            out.append(m)
     return {"ok": True, "projects": out}
 
 
@@ -916,8 +962,8 @@ def _project_stats(pid: str) -> dict:
 
 
 @app.get("/api/dashboard")
-def dashboard():
-    projs = list_projects()["projects"]
+def dashboard(request: Request):
+    projs = list_projects(request)["projects"]
     items, verified, total_passed = [], 0, 0
     for p in projs:
         st = _project_stats(p["id"])

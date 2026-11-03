@@ -43,11 +43,22 @@ def test_api_health_and_request_id(tmp_path: Path, monkeypatch):
     assert r.headers.get("X-Request-ID", "").startswith("req-")
 
 
-def test_api_project_flow_and_build(tmp_path: Path):
+def test_api_project_flow_and_build(tmp_path: Path, monkeypatch):
+    import os
+    monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
+    from app.auth import accounts as acc
+    codes = {}
+    monkeypatch.setattr(acc, "send_otp_mail",
+                        lambda to, code, mailer=None: codes.__setitem__(to, code))
     c = _client(tmp_path)
-    pid = c.post("/api/projects", json={"name": "Demo"}).json()["project"]["id"]
+    email = "flow@x.co"
+    assert c.post("/api/auth/request", json={"email": email}).status_code == 200
+    token = c.post("/api/auth/verify",
+                   json={"email": email, "code": codes[email], "name": "Flow"}).json()["token"]
+    h = {"Authorization": "Bearer " + token}
+    pid = c.post("/api/projects", json={"name": "Demo"}, headers=h).json()["project"]["id"]
     assert c.get(f"/api/projects/{pid}").json()["project"]["name"] == "Demo"
-    assert c.get("/api/projects").json()["projects"][0]["id"] == pid
+    assert c.get("/api/projects", headers=h).json()["projects"][0]["id"] == pid
     spec = c.post(f"/api/projects/{pid}/spec", json={"spec": SPEC}).json()
     assert spec["ok"] is True and len(spec["requirements"]) == 2
     chat = c.post(f"/api/projects/{pid}/chat", json={"message": "also add search"}).json()

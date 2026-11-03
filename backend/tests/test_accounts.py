@@ -153,3 +153,36 @@ def test_publish_claims_legacy_project(client):
     assert c.post(f"/api/projects/{pid}/publish", json={}, headers=h).status_code == 200
     meta = c.get(f"/api/projects/{pid}").json()["project"]
     assert meta["owner_email"] == "first@x.co"
+
+
+def test_listing_is_private_and_delete_works(client):
+    c, codes, _ = client
+    # logged out sees nothing
+    assert c.get("/api/projects").json() == {"ok": True, "projects": []}
+    assert c.get("/api/dashboard").json()["projects"] == []
+    token_a = _join(c, codes, "alice@x.co", name="Alice")
+    ha = {"Authorization": f"Bearer {token_a}"}
+    pid_a = c.post("/api/projects", json={"name": "A"}, headers=ha).json()["project"]["id"]
+    pid_legacy = c.post("/api/projects", json={"name": "Legacy"}).json()["project"]["id"]
+    token_b = _join(c, codes, "bob@x.co", name="Bob")
+    hb = {"Authorization": f"Bearer {token_b}"}
+    pid_b = c.post("/api/projects", json={"name": "B"}, headers=hb).json()["project"]["id"]
+    # alice sees hers + the unclaimed legacy, never bob's
+    ids = [p["id"] for p in c.get("/api/projects", headers=ha).json()["projects"]]
+    assert pid_a in ids and pid_legacy in ids and pid_b not in ids
+    dash = c.get("/api/dashboard", headers=ha).json()
+    assert {p["id"] for p in dash["projects"]} == set(ids)
+    # delete: logged out 401, stranger 403, unclaimed needs claim first
+    assert c.delete(f"/api/projects/{pid_a}").status_code == 401
+    assert c.delete(f"/api/projects/{pid_a}", headers=hb).status_code == 403
+    assert c.delete(f"/api/projects/{pid_legacy}", headers=ha).status_code == 403
+    c.post(f"/api/projects/{pid_legacy}/claim", headers=ha)
+    # publish then delete removes the public copy too
+    _make_frontend(c, pid_legacy)
+    slug = c.post(f"/api/projects/{pid_legacy}/publish", json={}, headers=ha).json()["slug"]
+    assert c.get(f"/p/{slug}/").status_code == 200
+    assert c.delete(f"/api/projects/{pid_legacy}", headers=ha).json()["ok"] is True
+    assert c.get(f"/p/{slug}/").status_code == 404
+    assert c.get(f"/api/projects/{pid_legacy}").status_code == 404
+    ids = [p["id"] for p in c.get("/api/projects", headers=ha).json()["projects"]]
+    assert pid_a in ids and pid_legacy not in ids
