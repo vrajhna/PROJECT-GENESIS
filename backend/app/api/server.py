@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from ..access import github as gh
 from ..access.zips import inspect_tree, make_zip, safe_extract
+from ..auth import accounts as accounts
 from ..agents.roles import ArchitectAgent, ReviewerAgent
 from ..builder.approvals import ApprovalGate
 from ..builder.files import GenesisWorkspace
@@ -244,12 +245,95 @@ def health():
 
 
 @app.post("/api/projects")
-def create_project(body: NewProject):
+def create_project(body: NewProject, request: Request):
     pid = f"proj-{uuid.uuid4().hex[:8]}"
+    me = current_member(request)
     meta = {"id": pid, "name": body.name, "spec": "", "created": time.time(),
-            "policy": {"autopilot": True}}
+            "policy": {"autopilot": True},
+            "owner_email": me["email"] if me else ""}
     save_project(meta)
     return {"ok": True, "project": meta}
+
+
+def _bearer(request: Request) -> str:
+    try:
+        return re.sub(r"^Bearer\s+", "",
+                      str(request.headers.get("authorization") or ""))
+    except Exception:
+        return ""
+
+
+def current_member(request: Request):
+    """Logged-in member dict or None. Never raises, never logs."""
+    try:
+        return accounts.member_from_token(_bearer(request))
+    except Exception:
+        return None
+
+
+class AuthEmailIn(BaseModel):
+    email: str = Field(min_length=3, max_length=120)
+
+
+class AuthVerifyIn(BaseModel):
+    email: str = Field(min_length=3, max_length=120)
+    code: str = Field(min_length=4, max_length=12)
+    name: str | None = Field(default=None, max_length=60)
+
+
+@app.post("/api/auth/request")
+def auth_request(body: AuthEmailIn, request: Request):
+    try:
+        accounts.request_otp(body.email)
+    except accounts.AuthFail as e:
+        return err(request, e.message, e.status)
+    return {"ok": True, "sent": True}
+
+
+@app.post("/api/auth/verify")
+def auth_verify(body: AuthVerifyIn, request: Request):
+    try:
+        out = accounts.verify_otp(body.email, body.code, body.name)
+    except accounts.NeedProfile as e:
+        return JSONResponse({"ok": False, "error": e.message,
+                             "needProfile": True,
+                             "request_id": getattr(request.state, "request_id", "")},
+                            status_code=400)
+    except accounts.AuthFail as e:
+        return err(request, e.message, e.status)
+    return {"ok": True, "token": out["token"],
+            "member": out["member"], "new": out["new"]}
+
+
+@app.get("/api/me")
+def auth_me(request: Request):
+    me = current_member(request)
+    if not me:
+        return err(request, "join first — login to continue", 401)
+    return {"ok": True, "member": me}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    accounts.logout(_bearer(request))
+    return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/claim")
+def claim_project(pid: str, request: Request):
+    me = current_member(request)
+    if not me:
+        return err(request, "join first — login to claim projects", 401)
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    if meta.get("owner_email"):
+        if meta["owner_email"] == me["email"]:
+            return {"ok": True, "owner_email": me["email"], "already": True}
+        return err(request, "already claimed by someone else", 403)
+    meta["owner_email"] = me["email"]
+    save_project(meta)
+    return {"ok": True, "owner_email": me["email"]}
 
 
 @app.get("/api/projects")
@@ -584,6 +668,184 @@ def download_zip(pid: str, request: Request):
     blob = make_zip(proj_dir(pid) / "work")
     return Response(blob, media_type="application/zip",
                     headers={"Content-Disposition": f"attachment; filename={pid}.zip"})
+
+
+PUBLISH_DIR = DATA_DIR / "published"
+PUBLISH_MAX_BYTES = 20 * 1024 * 1024
+PUBLISH_MAX_FILES = 2000
+PUBLISH_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".txt": "text/plain; charset=utf-8",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".map": "application/json",
+}
+SLUG_RE = re.compile(r"^[a-z0-9-]{1,80}$")
+
+
+def _slugify(name: str, pid: str) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", str(name or "").lower()).strip("-")
+    base = base[:40].strip("-") or "app"
+    return f"{base}-{pid[-6:]}"
+
+
+def _publishes_index() -> dict:
+    try:
+        return json.loads((PUBLISH_DIR / "publishes.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_publishes_index(idx: dict) -> None:
+    try:
+        PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
+        (PUBLISH_DIR / "publishes.json").write_text(json.dumps(idx, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _copy_publishable(src: Path, dest: Path) -> int:
+    """Copy a static frontend tree. Guards: size cap, file cap, no dotfiles,
+    no caches/venvs/node_modules. Returns file count. Raises ValueError."""
+    import shutil
+    if not (src / "index.html").is_file():
+        raise ValueError("nothing publishable — build a static frontend first (needs index.html)")
+    files: list[Path] = []
+    total = 0
+    for f in sorted(src.rglob("*")):
+        if not f.is_file() or f.is_symlink():
+            continue
+        rel = f.relative_to(src)
+        if any(part.startswith(".") or part in ("__pycache__", "node_modules", ".venv", "venv")
+               for part in rel.parts):
+            continue
+        if f.suffix == ".pyc":
+            continue
+        total += f.stat().st_size
+        files.append(f)
+    if total > PUBLISH_MAX_BYTES:
+        raise ValueError("too big to publish (20 MB cap on static sites)")
+    if len(files) > PUBLISH_MAX_FILES:
+        raise ValueError("too many files to publish (2000 cap)")
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        rel = f.relative_to(src)
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
+    return len(files)
+
+
+class PublishIn(BaseModel):
+    slug: str | None = Field(default=None, max_length=80)
+
+
+@app.post("/api/projects/{pid}/publish")
+def publish_project(pid: str, body: PublishIn, request: Request):
+    me = current_member(request)
+    if not me:
+        return err(request, "join first — login to publish", 401)
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    owner = meta.get("owner_email") or ""
+    if owner and owner != me["email"]:
+        return err(request, "not yours — only the owner can publish it", 403)
+    src = proj_dir(pid) / "work" / "frontend"
+    raw = (body.slug or "").strip().lower()
+    if raw:
+        if not SLUG_RE.match(raw):
+            return err(request, "slug must be letters, numbers and dashes", 400)
+        slug = raw
+    else:
+        slug = _slugify(meta.get("name") or "app", pid)
+    idx = _publishes_index()
+    taken = idx.get(slug)
+    if taken and taken.get("pid") != pid:
+        return err(request, f"slug taken — pick another one", 409)
+    try:
+        n = _copy_publishable(src, PUBLISH_DIR / slug)
+    except ValueError as e:
+        return err(request, str(e), 400)
+    except OSError:
+        return err(request, "storage unavailable", 500)
+    meta["owner_email"] = me["email"]
+    meta["publish"] = {"slug": slug, "at": int(time.time()), "files": n,
+                       "url": f"/p/{slug}/"}
+    save_project(meta)
+    idx[slug] = {"pid": pid, "owner": me["email"], "at": int(time.time())}
+    _save_publishes_index(idx)
+    return {"ok": True, "slug": slug, "files": n, "url": f"/p/{slug}/"}
+
+
+@app.delete("/api/projects/{pid}/publish")
+def unpublish_project(pid: str, request: Request):
+    me = current_member(request)
+    if not me:
+        return err(request, "join first — login to unpublish", 401)
+    meta = load_project(pid)
+    if meta is None:
+        return err(request, "unknown project", 404)
+    owner = meta.get("owner_email") or ""
+    if owner != me["email"]:
+        return err(request, "not yours — only the owner can unpublish it", 403)
+    slug = (meta.get("publish") or {}).get("slug") or ""
+    import shutil
+    if slug and SLUG_RE.match(slug):
+        try:
+            target = PUBLISH_DIR / slug
+            if target.is_dir():
+                shutil.rmtree(target)
+        except OSError:
+            pass
+        idx = _publishes_index()
+        idx.pop(slug, None)
+        _save_publishes_index(idx)
+    meta.pop("publish", None)
+    save_project(meta)
+    return {"ok": True, "unpublished": True}
+
+
+@app.get("/p/{slug}")
+def published_root(slug: str):
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=f"/p/{slug}/", status_code=302)
+
+
+@app.get("/p/{slug}/{rest:path}")
+def published_site(slug: str, rest: str):
+    from fastapi.responses import FileResponse, Response
+    if not SLUG_RE.match(slug or ""):
+        return Response("Not Found", status_code=404, media_type="text/plain")
+    base = (PUBLISH_DIR / slug).resolve()
+    try:
+        target = (base / (rest or "")).resolve()
+    except (OSError, ValueError):
+        return Response("Not Found", status_code=404, media_type="text/plain")
+    if base != target and base not in target.parents:
+        return Response("Not Found", status_code=404, media_type="text/plain")
+    if target.is_dir():
+        target = target / "index.html"
+    if not target.is_file():
+        # SPA fallback: extensionless deep links resolve to index.html
+        fallback = base / "index.html"
+        if "." not in Path(rest or "").name and fallback.is_file():
+            target = fallback
+        else:
+            return Response("Not Found", status_code=404, media_type="text/plain")
+    ctype = PUBLISH_TYPES.get(target.suffix.lower(), "application/octet-stream")
+    return FileResponse(str(target), media_type=ctype)
 
 
 @app.post("/api/projects/{pid}/github/clone")

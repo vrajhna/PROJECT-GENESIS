@@ -411,3 +411,37 @@
 - Frontend `typecheck` clean, `next build` green; affected backend tests
   (`test_access`, `test_pg_store`, `test_settings`, `test_workspace`):
   `28 passed, 1 skipped`. Full suite last green: `95 passed, 2 skipped`.
+
+## 2026-11-03 — OpenCode M3a+M3b: server accounts + one-click publish (LIVE-proven)
+
+- New `backend/app/auth/accounts.py`: email+OTP login, PaperOS-style.
+  sha256-hashed 6-digit codes, 10-minute expiry, 5 tries then dead, 5 codes
+  per 10 min per email, 30-day bearer sessions, stdlib smtplib mail
+  (HTML+text). No SMTP env = honest 503, never a fake success. Storage:
+  Postgres tables (`genesis_users/otps/sessions`, added to shared schema)
+  with JSON-files fallback; codes/tokens never printed or logged.
+- `server.py`: `POST /api/auth/request|verify`, `GET /api/me`,
+  `POST /api/auth/logout`, bearer helper `current_member()` (never raises).
+  Projects stamp `owner_email` when created logged-in; explicit
+  `POST /api/projects/{pid}/claim` for legacy ownerless projects.
+- Publish (auth-gated): `POST /api/projects/{pid}/publish` copies the built
+  static `work/frontend/` (index.html required, 20 MB / 2000-file caps, no
+  dotfiles/caches/venvs/symlinks) to `/data/published/{slug}/` (Volume =
+  survives redeploys). Serves at `/p/{slug}/` with correct content types,
+  SPA fallback, no directory listing, `..` trapped to 404. First publish
+  claims legacy projects transparently (recorded in meta). `DELETE`
+  unpublishes (owner only). Slug from name + id suffix, collision-safe.
+- Frontend: studio account row (email → code → name, session in
+  localStorage, logout), Publish live / Unpublish buttons next to
+  Download ZIP, publish doc rewritten (one-click first, ZIP path kept),
+  onboarding copy updated (server accounts are live).
+- Tests: new `test_accounts.py` — 7 passed (full flow, try-limits, rate
+  limit, ownership/claim, publish lifecycle incl. traversal + authz).
+  Full suite: `102 passed, 2 skipped`. Typecheck + build clean.
+- LIVE proof (local, exact-PID restarts): debug SMTP sink received a real
+  MIME mail → code verified → token → /api/me → owned project → publish →
+  public URL served (index/assets 200, SPA fallback 200, traversal 404).
+  Editor restarted on :3101 with the new UI (Publish live marker confirmed
+  in the client bundle).
+- Caught while wiring: stray JS-isms in new Python (`String()`,
+  `.toLowerCase`) — tests + live run found them, fixed, re-verified, swept.

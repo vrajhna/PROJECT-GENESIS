@@ -575,7 +575,7 @@ function Onboard({ onDone }: { onDone: (name: string) => void }) {
     <div className="doc-inner">
       <p className="crumb">$ whoami — 30 seconds, once</p>
       <h1 className="doctitle">Log in on this device.</h1>
-      <p className="docsub">A local profile — your name stays in this browser, on this machine. No password, no server account yet.</p>
+      <p className="docsub">A local profile — your name stays in this browser, on this machine. No password. Want your work under your name everywhere? Log in inside the studio — code by email.</p>
       <p>
         <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && done()}
           placeholder="your name" aria-label="Your name"
@@ -905,21 +905,22 @@ function PublishDoc() {
     <>
       <p className="crumb">publish</p>
       <h1 className="doctitle">Ship it under your domain.</h1>
-      <p className="docsub">Every project downloads as a runnable ZIP. Point a subdomain at a server, serve the ZIP — done. No fake one-click button: the honest path is below.</p>
+      <p className="docsub">Studio §5 → Publish live → your app is on our domain in seconds, stamped with your account. Unpublish anytime. The ZIP path still works for your own servers.</p>
 
-      <h2 className="sect">$ 1 · download the build</h2>
+      <h2 className="sect">$ 1 · one-click publish</h2>
+      <p className="prose">Log in (studio top → Log in / join, code by email). Open your project, press <strong>Publish live →</strong>. Genesis copies the built static frontend to our hosting and hands you a link like <code>/p/shop-a1b2c3/</code>. Seconds, no terminal.</p>
+
+      <h2 className="sect">$ 2 · who can touch it</h2>
+      <p className="prose">Publishing stamps the project with your account. Only you can re-publish or unpublish it. Legacy projects with no owner are claimed by whoever publishes first — visible in the project record.</p>
+
+      <h2 className="sect">$ 3 · your own server (ZIP path)</h2>
       <p className="prose">Studio §5 → Download ZIP. Unzip on the host machine. Every ZIP carries <code>SETUP.md</code> + <code>.env.example</code>.</p>
 
-      <h2 className="sect">$ 2 · point the subdomain</h2>
-      <p className="prose">In your DNS for <code>webstudiobhiwadi.com</code>, add:</p>
+      <h2 className="sect">$ 4 · point a subdomain at it</h2>
       <pre className="out">genesis.webstudiobhiwadi.com.  A  YOUR_SERVER_IP{"\n"}# or, if your host gives you a name:{"\n"}genesis.webstudiobhiwadi.com.  CNAME  your-host.example.net.</pre>
 
-      <h2 className="sect">$ 3 · serve it (caddy)</h2>
-      <pre className="out">genesis.webstudiobhiwadi.com {"{\n"}    reverse_proxy 127.0.0.1:3101{"\n"}{"}"}{"\n\n"}# one built app per subdomain, e.g. shop on :8001{"\n"}shop.webstudiobhiwadi.com {"{\n"}    reverse_proxy 127.0.0.1:8001{"\n"}{"}"}</pre>
-
-      <h2 className="sect">$ 4 · per-app publish</h2>
-      <p className="prose">A built app is one process: <code>python3 backend/server.py --port 8001</code> serves frontend + API on that port. Give it a subdomain + a reverse-proxy line each. HTTPS comes free with Caddy.</p>
-      <p className="prose">Blocked until you provide hosting credentials: true one-click publish from inside Genesis. Everything above works today.</p>
+      <h2 className="sect">$ 5 · serve it (caddy)</h2>
+      <pre className="out">genesis.webstudiobhiwadi.com {"\n"}    reverse_proxy 127.0.0.1:3101{"\n"}{"}"}{"\n\n"}# one built app per subdomain, e.g. shop on :8001{"\n"}shop.webstudiobhiwadi.com {"\n"}    reverse_proxy 127.0.0.1:8001{"\n"}{"}"}{"\n\n"}# a built app is one process: <code>python3 backend/server.py --port 8001</code> serves frontend + API on that port. HTTPS comes free with Caddy.</pre>
     </>
   );
 }

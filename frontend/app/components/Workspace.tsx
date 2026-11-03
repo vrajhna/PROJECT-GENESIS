@@ -57,6 +57,157 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   });
   const [auto, setAuto] = useState<boolean | null>(null);
 
+  /* ---- server account (email OTP, PaperOS-style) ---- */
+  const [member, setMember] = useState<{ email: string; name: string } | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authCode, setAuthCode] = useState("");
+  const [authName, setAuthName] = useState("");
+  const [needName, setNeedName] = useState(false);
+  const [pubUrl, setPubUrl] = useState("");
+
+  function authToken(): string | null {
+    try {
+      return window.localStorage.getItem("genesis-member-token");
+    } catch {
+      return null;
+    }
+  }
+
+  function authHeaders(): Record<string, string> {
+    const h: Record<string, string> = { "Content-Type": "application/json" };
+    const t = authToken();
+    if (t) h["Authorization"] = `Bearer ${t}`;
+    return h;
+  }
+
+  async function refreshMe() {
+    const t = authToken();
+    if (!t) {
+      setMember(null);
+      return;
+    }
+    try {
+      const r = await fetch(`${API}/api/me`, { headers: { Authorization: `Bearer ${t}` } });
+      const j = await r.json();
+      if (j.ok) setMember(j.member);
+      else {
+        setMember(null);
+        try {
+          window.localStorage.removeItem("genesis-member-token");
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch {
+      /* offline — keep local state */
+    }
+  }
+
+  async function requestCode() {
+    const email = authEmail.trim();
+    if (!email) return setNotice("Type your email first.");
+    setBusy("Sending code…");
+    try {
+      const r = await fetch(`${API}/api/auth/request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const j = await r.json();
+      if (j.ok) setNotice(`Code sent to ${email} — check inbox (and spam). Valid 10 minutes.`);
+      else setNotice(j.error || "Could not send a code.");
+    } catch {
+      setNotice("Backend is offline.");
+    }
+    setBusy("");
+  }
+
+  async function verifyCode() {
+    const email = authEmail.trim();
+    if (!email || !authCode.trim()) return setNotice("Email + code, then verify.");
+    setBusy("Verifying…");
+    try {
+      const r = await fetch(`${API}/api/auth/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, code: authCode.trim(), name: authName.trim() || undefined }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        try {
+          window.localStorage.setItem("genesis-member-token", j.token);
+        } catch {
+          /* ignore */
+        }
+        setMember(j.member);
+        setAuthOpen(false);
+        setAuthCode("");
+        setNeedName(false);
+        setNotice(`Welcome${j.new ? "" : " back"}, ${j.member.name}. Your work now saves under your name.`);
+      } else if (j.needProfile) {
+        setNeedName(true);
+        setNotice("First login — add your name, then verify again (same code still works).");
+      } else setNotice(j.error || "That code did not work.");
+    } catch {
+      setNotice("Backend is offline.");
+    }
+    setBusy("");
+  }
+
+  async function logout() {
+    const t = authToken();
+    try {
+      if (t) await fetch(`${API}/api/auth/logout`, { method: "POST", headers: { Authorization: `Bearer ${t}` } });
+    } catch {
+      /* ignore */
+    }
+    try {
+      window.localStorage.removeItem("genesis-member-token");
+    } catch {
+      /* ignore */
+    }
+    setMember(null);
+    setNotice("Logged out on this device.");
+  }
+
+  async function publish() {
+    if (!pid) return setNotice("Create a project first.");
+    if (!authToken()) {
+      setAuthOpen(true);
+      return setNotice("Login first — publishing stamps your name on it.");
+    }
+    setBusy("Publishing…");
+    try {
+      const r = await fetch(`${API}/api/projects/${pid}/publish`, { method: "POST", headers: authHeaders(), body: "{}" });
+      const j = await r.json();
+      if (j.ok) {
+        const url = `${API}${j.url}`;
+        setPubUrl(url);
+        setNotice(`Live in seconds: ${url}`);
+      } else setNotice(j.error || "Publish failed.");
+    } catch {
+      setNotice("Publish failed — is the backend still running?");
+    }
+    setBusy("");
+  }
+
+  async function unpublish() {
+    if (!pid || !authToken()) return;
+    setBusy("Unpublishing…");
+    try {
+      const r = await fetch(`${API}/api/projects/${pid}/publish`, { method: "DELETE", headers: authHeaders() });
+      const j = await r.json();
+      if (j.ok) {
+        setPubUrl("");
+        setNotice("Unpublished — the link is dead.");
+      } else setNotice(j.error || "Could not unpublish.");
+    } catch {
+      setNotice("Backend is offline.");
+    }
+    setBusy("");
+  }
+
   async function flipAuto(v: boolean) {
     if (!pid) return setNotice("Create a project first.");
     try {
@@ -102,6 +253,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
 
   useEffect(() => {
     check();
+    refreshMe();
   }, []);
 
   async function newProject() {
@@ -109,7 +261,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     try {
       const r = await fetch(`${API}/api/projects`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({ name: pname || "Untitled" }),
       });
       const j = await r.json();
@@ -381,10 +533,43 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
         You don&apos;t need to code. Describe the idea, and GENESIS generates,
         runs, tests, repairs and verifies — showing every step, never faking one.
       </p>
-      <p className="docmeta">
-        backend{" "}
-        {online === null ? "…" : online ? <strong>online</strong> : <strong>OFFLINE — start it below</strong>}
-      </p>
+        <p className="docmeta">
+          backend{" "}
+          {online === null ? "…" : online ? <strong>online</strong> : <strong>OFFLINE — start it below</strong>}
+        </p>
+        <p className="prose">
+          <span className="hl">account</span>{" "}
+          {member ? (
+            <>
+              {member.name} · {member.email}{" "}
+              <button type="button" className="btn" style={{ fontSize: 12, padding: "4px 12px" }} onClick={logout}>Log out</button>
+            </>
+          ) : (
+            <>
+              browsing as guest — projects stay local{" "}
+              <button type="button" className="btn primary" style={{ fontSize: 12, padding: "4px 12px" }} onClick={() => setAuthOpen((v) => !v)}>Log in / join</button>
+            </>
+          )}
+        </p>
+        {authOpen && !member && (
+          <div style={{ marginTop: 8 }}>
+            <p className="prose">Email login — code by mail, no password. First login asks your name once.</p>
+            <p>
+              <input value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@example.com" aria-label="Email"
+                style={{ font: "inherit", fontSize: 12, padding: "6px 10px", borderRadius: 3, border: "1px solid var(--line2)", background: "#080b10", color: "inherit", width: "min(260px, 100%)" }} />{" "}
+              <button type="button" className="btn" onClick={requestCode}>Send code</button>
+            </p>
+            <p>
+              <input value={authCode} onChange={(e) => setAuthCode(e.target.value)} placeholder="6-digit code" aria-label="Login code" inputMode="numeric"
+                style={{ font: "inherit", fontSize: 12, padding: "6px 10px", borderRadius: 3, border: "1px solid var(--line2)", background: "#080b10", color: "inherit", width: "min(140px, 100%)" }} />{" "}
+              {needName && (
+                <><input value={authName} onChange={(e) => setAuthName(e.target.value)} placeholder="Your name" aria-label="Your name"
+                  style={{ font: "inherit", fontSize: 12, padding: "6px 10px", borderRadius: 3, border: "1px solid var(--line2)", background: "#080b10", color: "inherit", width: "min(180px, 100%)" }} />{" "}</>
+              )}
+              <button type="button" className="btn primary" onClick={verifyCode}>Verify</button>
+            </p>
+          </div>
+        )}
 
       <section>
         <h2 className="sect">0 · Dashboard</h2>
@@ -528,8 +713,11 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
         <h2 className="sect">5 · Files, tests, preview</h2>
         <p>
           <button type="button" className="btn" onClick={() => refreshTree()}>Refresh files</button>{" "}
-          {pid && <a className="hl" href={`${API}/api/projects/${pid}/download`}>▸ Download ZIP</a>}
+          {pid && <a className="hl" href={`${API}/api/projects/${pid}/download`}>▸ Download ZIP</a>}{" "}
+          {pid && <button type="button" className="btn primary" onClick={publish}>Publish live →</button>}{" "}
+          {pid && <button type="button" className="btn" onClick={unpublish}>Unpublish</button>}
         </p>
+        {pubUrl && <p className="prose"><span className="hl">live</span> <a className="hl" href={pubUrl} target="_blank" rel="noreferrer">{pubUrl}</a> — on our domain, in seconds.</p>}
         {files.length > 0 && (
           <p className="prose">
             {files.slice(0, 60).map((f) => (

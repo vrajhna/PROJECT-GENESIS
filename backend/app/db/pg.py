@@ -28,6 +28,17 @@ SCHEMA = (
     "  project TEXT NOT NULL, payload JSONB NOT NULL, verified BOOLEAN NOT NULL)",
     "CREATE INDEX IF NOT EXISTS genesis_exp_kind_idx"
     " ON genesis_experience (kind, project, verified)",
+    # Server accounts (email OTP + sessions). Same IF NOT EXISTS discipline.
+    "CREATE TABLE IF NOT EXISTS genesis_users"
+    " (email TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',"
+    "  created_at BIGINT NOT NULL DEFAULT 0, last_login BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS genesis_otps"
+    " (email TEXT PRIMARY KEY, hash TEXT NOT NULL DEFAULT '',"
+    "  exp BIGINT NOT NULL DEFAULT 0, tries INT NOT NULL DEFAULT 0,"
+    "  count INT NOT NULL DEFAULT 0, window_start BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS genesis_sessions"
+    " (token TEXT PRIMARY KEY, email TEXT NOT NULL DEFAULT '',"
+    "  exp BIGINT NOT NULL DEFAULT 0)",
 )
 
 _prob_cache: tuple[float, bool] = (0.0, False)
