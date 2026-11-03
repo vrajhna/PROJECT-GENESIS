@@ -506,7 +506,7 @@ function PartNine() {
 
 type Doc = "studio" | "about" | "download" | "models" | "playground" | "publish" | "pricing" | "i" | "ii" | "iii" | "iv" | "v" | "vi" | "vii" | "viii" | "ix";
 
-const API = "http://127.0.0.1:8000";
+const API = process.env.NEXT_PUBLIC_GENESIS_API || "http://127.0.0.1:8000";
 
 const TROPHIES: Array<[string, string]> = [
   ["open-studio", "Open the studio"],

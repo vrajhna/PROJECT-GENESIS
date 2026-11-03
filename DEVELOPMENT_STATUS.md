@@ -365,3 +365,49 @@
   Live: store spec -> questions `[('db','sqlite'),('payments','none')]`, bad answers -> 400.
 - Servers restarted by exact PID; backend `:8000 /api/health ok`, editor `:3101 HTTP 200`
   with `Build full app` / `Watch it work` markers in served HTML.
+
+## 2026-11-03 — OpenCode M2: engine Postgres (files fallback intact)
+
+- New `backend/app/db/pg.py`: DATABASE_URL-gated helpers, zero global state.
+  `ensure_schema()` creates `genesis_kv`, `genesis_hits`, `genesis_experience`
+  (IF NOT EXISTS, never destructive); kv get/set; hits insert/count/prune;
+  experience insert/filtered-query/confirm (KeyError/ValueError semantics match
+  the file store). Every helper fails soft; `available()` caches a 60s probe.
+- `memory/experience_store.py`: new `PgExperienceStore` (same record/query/
+  confirm contract, per-call connections, closes always). `MemoryService`
+  uses it only when Postgres probes live, else the JSONL file — plus a
+  degraded-confirm path that falls back to the file ledger instead of crashing.
+- `api/server.py`: rate limiter now writes the shared `genesis_hits` window
+  when Postgres is live (multi-worker ready), in-memory otherwise; Connect
+  probe (`_pg_reachable`) also ensures the engine schema and says so.
+- `requirements.txt`: `psycopg2-binary>=2.9` (matches the existing probe import).
+- Tests: new `backend/tests/test_pg_store.py` — 13 passed on fakes (SQL shapes,
+  lifecycle, fallback, shared-limiter paths); live roundtrip SKIPPED without
+  DATABASE_URL (runs on Railway). Full suite: `95 passed, 2 skipped`.
+- Servers untouched by the edits (running processes keep old code until a
+  PID-exact restart): API `:8000 /api/health ok`, editor `:3101 HTTP 200`.
+  Module import re-verified after the edits.
+
+## 2026-11-03 — OpenCode M1: Railway deploy configs (images proven, not claimed)
+
+- `frontend`: API base is env-driven —
+  `process.env.NEXT_PUBLIC_GENESIS_API || "http://127.0.0.1:8000"` in
+  `Workspace.tsx` and `page.tsx`. Local dev unchanged.
+- `backend/app/api/server.py`: CORS origins now extend from
+  `GENESIS_CORS_ORIGINS` (comma-separated) on top of the localhost defaults.
+- `backend/Dockerfile` (uvicorn on `$PORT`, `GENESIS_DATA_DIR=/data`) and
+  `frontend/Dockerfile` (build arg baked, `next start` on `$PORT`), plus
+  `.dockerignore` files and `RAILWAY_DEPLOY.md` (2 services + Postgres plugin,
+  variables, Volume, health checks, exact DNS table, verify steps).
+- `.env.example`: `GENESIS_DATA_DIR`, `DATABASE_URL`, `GENESIS_CORS_ORIGINS`,
+  `NEXT_PUBLIC_GENESIS_API` documented (values only, never secrets).
+- Docker actually built and ran here: `genesis-api:verify` booted and served
+  `/api/health ok` + honest sqlite fallback; `genesis-web:verify` served
+  HTTP 200 with the production API base present in the client bundle.
+  Both images/containers removed after proof.
+- Docker caught one real gap: `python-multipart` was installed on this
+  machine but missing from `requirements.txt`, so the container crashed on
+  boot. Fixed (`python-multipart>=0.0.9`), image rebuilt, health re-verified.
+- Frontend `typecheck` clean, `next build` green; affected backend tests
+  (`test_access`, `test_pg_store`, `test_settings`, `test_workspace`):
+  `28 passed, 1 skipped`. Full suite last green: `95 passed, 2 skipped`.

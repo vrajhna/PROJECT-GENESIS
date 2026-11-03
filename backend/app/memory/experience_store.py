@@ -60,3 +60,78 @@ class ExperienceStore:
             out.append(Experience(**{k: row[k] for k in
                                      ("id", "time", "kind", "project", "payload", "verified")}))
         return out
+
+
+class PgExperienceStore:
+    """Postgres-backed twin of ExperienceStore (table genesis_experience).
+
+    Same record/query/confirm contract. Used when DATABASE_URL is live;
+    every failure must make the caller fall back to files, never crash.
+    """
+
+    def __init__(self) -> None:
+        from ..db import pg as _pg
+        self._pg = _pg
+        con = _pg.connect()
+        if con is None:
+            raise ConnectionError("postgres unavailable")
+        try:
+            if not _pg.ensure_schema(con):
+                raise ConnectionError("schema not ready")
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+    def _conn(self):
+        con = self._pg.connect()
+        if con is None:
+            raise ConnectionError("postgres unavailable")
+        return con
+
+    def record(self, kind: str, project: str, payload: dict,
+               verified: bool = False) -> Experience:
+        if kind not in KINDS:
+            raise ValueError(f"unknown experience kind: {kind}")
+        exp = Experience(id=f"exp-{uuid.uuid4().hex[:12]}",
+                         time=datetime.now(timezone.utc).isoformat(),
+                         kind=kind, project=project,
+                         payload=payload, verified=verified)
+        con = self._conn()
+        try:
+            self._pg.exp_insert(con, asdict(exp))
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return exp
+
+    def query(self, kind: str | None = None, project: str | None = None,
+              verified_only: bool = False) -> list[Experience]:
+        con = self._conn()
+        try:
+            rows = self._pg.exp_query(con, kind=kind, project=project,
+                                      verified_only=verified_only)
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return [Experience(**r) for r in rows]
+
+    def confirm(self, experience_id: str) -> Experience:
+        con = self._conn()
+        try:
+            self._pg.exp_confirm(con, experience_id)
+            rows = self._pg.exp_query(con, limit=5000)
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        for r in rows:
+            if r["id"] == experience_id:
+                return Experience(**r)
+        raise KeyError(experience_id)

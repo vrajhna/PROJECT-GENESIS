@@ -35,17 +35,58 @@ DATA_DIR = Path(__import__("os").environ.get("GENESIS_DATA_DIR", "/tmp/genesis-d
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Genesis", version="0.1.0")
+
+
+def _cors_origins() -> list[str]:
+    origins = ["http://localhost:3101", "http://127.0.0.1:3101",
+               "http://localhost:3000", "http://127.0.0.1:3000"]
+    try:
+        import os
+        extra = [o.strip() for o in os.environ.get("GENESIS_CORS_ORIGINS", "").split(",")]
+        origins.extend(o for o in extra if o.startswith(("http://", "https://")))
+    except Exception:
+        pass
+    return origins
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3101", "http://127.0.0.1:3101",
-                   "http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=_cors_origins(),
     allow_methods=["*"], allow_headers=["*"],
 )
 
 
+def _shared_allowed(ip: str, now: float, per_minute: int) -> bool | None:
+    """Shared Postgres window (table genesis_hits) so limits hold across
+    workers. Returns None when Postgres is absent/broken — the caller then
+    uses the in-memory window instead. Never raises."""
+    try:
+        from ..db import pg as _pg
+        con = _pg.connect()
+        if con is None:
+            return None
+        try:
+            _pg.ensure_schema(con)
+            _pg.prune_hits(con, now - 60)
+            n = _pg.count_recent(con, ip, now - 60)
+            if n >= per_minute:
+                return False
+            _pg.hit(con, ip, now)
+            return True
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
 class _RateLimiter:
-    """In-memory sliding window. Loopback-only today, but the same box will
-    serve webstudiobhiwadi.com tomorrow — limits already enforced."""
+    """Sliding window, shared across workers when Postgres is live.
+
+    Loopback-only today, but the same box will serve webstudiobhiwadi.com
+    tomorrow — limits already enforced."""
 
     def __init__(self, per_minute: int = 300) -> None:
         self.per_minute = per_minute
@@ -53,6 +94,9 @@ class _RateLimiter:
 
     def allowed(self, ip: str) -> bool:
         now = time.time()
+        shared = _shared_allowed(ip, now, self.per_minute)
+        if shared is not None:
+            return shared
         window = [t for t in self.hits.get(ip, []) if now - t < 60]
         window.append(now)
         self.hits[ip] = window[-600:]
@@ -278,20 +322,25 @@ def get_database():
 
 
 def _pg_reachable(url: str) -> tuple[bool, str]:
-    """Real reachability probe: connect + SELECT 1, 5s cap. Never raises."""
+    """Real reachability probe: connect + SELECT 1 + ensure engine schema,
+    5s cap. Never raises."""
     try:
         import psycopg2
     except ImportError:
         return False, "pending — psycopg2 not installed"
     try:
+        from ..db import pg as _pg
         con = psycopg2.connect(url, connect_timeout=5)
         try:
             cur = con.cursor()
             cur.execute("SELECT 1")
             cur.fetchone()
+            schema_ok = _pg.ensure_schema(con)
         finally:
             con.close()
-        return True, "verified — reachable, SELECT 1 ok"
+        if not schema_ok:
+            return False, "pending — connected but schema setup failed"
+        return True, "verified — reachable, SELECT 1 ok, engine tables ready"
     except Exception as e:
         return False, f"pending — unreachable: {str(e)[:160]}"
 

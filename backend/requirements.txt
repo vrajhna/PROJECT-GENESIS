@@ -1,3 +1,5 @@
 pytest>=8
 fastapi>=0.140
 uvicorn>=0.51
+python-multipart>=0.0.9  # file/ZIP upload endpoints (FastAPI Form/UploadFile)
+psycopg2-binary>=2.9  # engine Postgres store (Railway plugin); files when absent

@@ -5,9 +5,20 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .experience_store import Experience, ExperienceStore
+from .experience_store import Experience, ExperienceStore, PgExperienceStore
 from .retrieval import retrieve
 from .skill_registry import Skill, SkillRegistry
+
+
+def _pg_store():
+    """PgExperienceStore when Postgres is live, else None. Never raises."""
+    try:
+        from ..db import pg as _pg
+        if not _pg.available():
+            return None
+        return PgExperienceStore()
+    except Exception:
+        return None
 
 
 class MemoryService:
@@ -20,7 +31,8 @@ class MemoryService:
 
     def __init__(self, root: Path, project: str = "genesis") -> None:
         base = root / ".genesis"
-        self.store = ExperienceStore(base / "experiences.jsonl")
+        self.store = _pg_store() or ExperienceStore(base / "experiences.jsonl")
+        self._file_base = base
         self.skills = SkillRegistry(base / "skills.json")
         self.project = project
 
@@ -32,9 +44,19 @@ class MemoryService:
 
     def confirm(self, experience_id: str) -> Experience:
         """Promote a suggestion to verified knowledge after execution proof."""
-        if not self.store.path.exists():
+        store = self.store
+        if hasattr(store, "confirm"):
+            try:
+                return store.confirm(experience_id)
+            except (KeyError, ValueError):
+                raise
+            except Exception:
+                # Postgres hiccup mid-flight: degrade to the file ledger
+                # rather than crash. May raise KeyError if it lived only in pg.
+                store = ExperienceStore(self._file_base / "experiences.jsonl")
+        if not store.path.exists():
             raise KeyError(experience_id)
-        rows = self.store.path.read_text(encoding="utf-8").splitlines()
+        rows = store.path.read_text(encoding="utf-8").splitlines()
         out = []
         found = None
         for line in rows:
@@ -50,7 +72,7 @@ class MemoryService:
             out.append(json.dumps(row))
         if found is None:
             raise KeyError(experience_id)
-        self.store.path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        store.path.write_text("\n".join(out) + "\n", encoding="utf-8")
         return Experience(**{k: found[k] for k in
                              ("id", "time", "kind", "project", "payload", "verified")})
 
