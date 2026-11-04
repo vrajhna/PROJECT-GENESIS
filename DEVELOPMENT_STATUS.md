@@ -559,6 +559,33 @@
   run_id → poll → VERIFIED with review/live/secure lanes + report.json.
   Full suite: `117 passed` (2 live tests deselected — need a valid key).
 
+## 2026-11-04 — Speed + terminal path: warm venvs, shippable CLI image
+
+- Warm venv cache (`app/builder/venv_cache.py`): first build per machine
+  pays venv+pytest once into `GENESIS_DATA_DIR/.venv-cache/py3.x`;
+  every later build clones it in seconds. Clones are independent copies;
+  broken templates self-heal to a fresh build. Both builders
+  (pipeline + fullstack) use it; the install step names the cache hit.
+- Docker image now ships `genesis-cli/` + `tests/` (they were missing —
+  `/api/download/cli` and the installers 500d on Railway while the repo
+  had them all along). Verified by local docker build + listing `/srv`.
+- Tests: `test_venv_cache.py` (miss→template, hit→clone, broken→heal).
+
+## Postscript — shebang poisoning caught by the suite (same day)
+
+- First full run with the cache: 9 systematic `FileNotFoundError: .../bin/pip`
+  failures. Root cause, proven: venv `bin/*` scripts carry shebangs with the
+  ABSOLUTE path of the venv that created them. The template was born inside a
+  pytest tmp dir; tmp cleanup left every clone's pip/pytest scripts pointing
+  at a deleted interpreter (the kernel reports it as FileNotFoundError naming
+  the script). The readiness check missed it because it ran `bin/python -m`
+  (symlink, always valid).
+- Fix: execute everything as `bin/python -m pip|pytest` (module form ignores
+  shebangs), readiness check now also runs `pip --version`, templates still
+  self-heal. New regression test deletes the source venv then clones.
+  Full suite after fix: `183 passed` (2 live deselected). Lesson recorded:
+  never trust a venv by its symlinks; execute by module path.
+
 ## 2026-11-04 — Meta connectivity: diagnosed per official docs, hardened
 
 - Verified our client against the official spec (Models + Authentication

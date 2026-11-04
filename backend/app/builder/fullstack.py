@@ -1230,22 +1230,16 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
              ((f"game: canvas {game_name} + score API + tests for score.") if game
               else f"frontend (3 files) + backend + SQLite schema + tests for {', '.join(resources)}."), lane="builder")
 
-    venv = workdir / ".venv"
-    try:
-        proc = subprocess.run(["python3", "-m", "venv", str(venv)],
-                              capture_output=True, text=True, timeout=120, shell=False)
-    except subprocess.TimeoutExpired:
-        step("install", False, "venv creation timed out.", lane="live")
-        report["reason"] = "venv creation timed out"
+    from .venv_cache import warm_venv
+    venv_ok, vpy, vpip, venv_msg = warm_venv(workdir)
+    if not venv_ok:
+        step("install", False, venv_msg, lane="live")
+        report["reason"] = venv_msg
         return report
-    if proc.returncode != 0:
-        step("install", False, f"venv failed: {proc.stderr[-500:]}", lane="live")
-        report["reason"] = "venv creation failed"
-        return report
+    step("install", True, venv_msg, lane="live")
     import os as _os
     import re as _re
 
-    vpy, vpip = str(venv / "bin" / "python"), str(venv / "bin" / "pip")
     log_path = workdir / "app.log"
 
     def _stop(srv):
@@ -1279,7 +1273,7 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
         _stop(server)
         server = None
         try:
-            proc = subprocess.run([vpip, "install", "-q", "pytest"],
+            proc = subprocess.run([vpy, "-m", "pip", "install", "-q", "pytest"],
                                   capture_output=True, text=True, timeout=240, shell=False)
             ok_install = proc.returncode == 0
             install_msg = ("venv + pytest ready." if ok_install

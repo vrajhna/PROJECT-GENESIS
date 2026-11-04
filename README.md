@@ -6,7 +6,7 @@ Autonomous software engineering intelligence. From specification to verified sof
 
 - `backend/` — FastAPI API, agent roles, tool registry, memory, improvement loop, DB schema, pipeline, 178-test suite
 - `frontend/` — Next.js editor-style console (the studio workspace + spec docs part-i … part-ix)
-- `ARCHITECTURE.md`, `IMPLEMENTATION_PLAN.md`, `DEVELOPMENT_STATUS.md` — design, plan, running ledger
+- `ARCHITECTURE.md`, `IMPLEMENTATION_PLAN.md`, `GUIDE.md` — design, plan, user guide
 - `.env.example` — copy to `.env` and fill `MODEL_API_KEY` for live model calls
 
 Excluded on purpose (regenerated, never edited by hand): `frontend/node_modules/`, `frontend/.next/`, Python caches.

@@ -5,6 +5,8 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
+COPY genesis-cli ./genesis-cli
+COPY tests ./tests
 
 # Railway injects PORT. GENESIS_DATA_DIR must be a mounted Volume (/data).
 ENV GENESIS_DATA_DIR=/data

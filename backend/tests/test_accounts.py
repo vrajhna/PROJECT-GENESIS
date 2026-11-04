@@ -329,3 +329,24 @@ def test_health_mode_and_require_db(tmp_path, monkeypatch):
     r = c.get("/api/health")
     assert r.status_code == 503
     assert "DATABASE_URL" in r.json()["error"]
+
+
+def test_cookie_secure_on_production_host(client):
+    c, codes, _ = client
+    email = "prod@x.co"
+    r = c.post("/api/auth/request", json={"email": email})
+    assert r.status_code == 200, r.text
+    r = c.post("/api/auth/verify",
+               json={"email": email, "code": codes[email], "name": "Prod"},
+               headers={"host": "genesis-api.webstudiobhiwadi.com"})
+    assert r.status_code == 200, r.text
+    sc = r.headers.get("set-cookie", "")
+    assert "genesis_session=" in sc
+    assert "; Secure" in sc and "samesite=none" in sc.lower().replace(" ", "")
+    # local/test hosts must NOT force Secure (laptop mode over http)
+    email2 = "loc@x.co"
+    assert c.post("/api/auth/request", json={"email": email2}).status_code == 200
+    r2 = c.post("/api/auth/verify",
+                json={"email": email2, "code": codes[email2], "name": "Loc"})
+    sc2 = r2.headers.get("set-cookie", "")
+    assert "genesis_session=" in sc2 and "Secure" not in sc2

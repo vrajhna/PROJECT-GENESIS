@@ -123,22 +123,14 @@ def build_and_verify(spec: str, workdir: Path, timeout_s: int = 600) -> dict:
     step("generate", True, build.summary,
          f"files: {', '.join(build.data['files'] + ['app_server.py', 'test_server.py'])}")
 
-    venv = workdir / ".venv"
-    try:
-        proc = subprocess.run(["python3", "-m", "venv", str(venv)],
-                              capture_output=True, text=True, timeout=120, shell=False)
-    except subprocess.TimeoutExpired:
-        step("install", False, "venv creation timed out.")
-        report["reason"] = "venv creation timed out"
+    from .venv_cache import warm_venv
+    venv_ok, vpy, vpip, venv_msg = warm_venv(workdir)
+    if not venv_ok:
+        step("install", False, venv_msg)
+        report["reason"] = venv_msg
         return report
-    if proc.returncode != 0:
-        step("install", False, f"venv failed: {proc.stderr[-500:]}")
-        report["reason"] = "venv creation failed"
-        return report
-    vpy = str(venv / "bin" / "python")
-    vpip = str(venv / "bin" / "pip")
     try:
-        proc = subprocess.run([vpip, "install", "-q", "pytest"],
+        proc = subprocess.run([vpy, "-m", "pip", "install", "-q", "pytest"],
                               capture_output=True, text=True, timeout=240, shell=False)
     except subprocess.TimeoutExpired:
         step("install", False, "pip install timed out.")
