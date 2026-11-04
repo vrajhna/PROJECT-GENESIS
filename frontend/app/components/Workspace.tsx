@@ -68,6 +68,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [files, setFiles] = useState<string[]>([]);
+  const [snaps, setSnaps] = useState<{ at: string; files: number }[]>([]);
   const [sel, setSel] = useState("");
   const [code, setCode] = useState("");
   const [ghUrl, setGhUrl] = useState("");
@@ -206,6 +207,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       const j = await r.json();
       if (j.ok) {
         setPubUrl("");
+    setSnaps([]);
         setNotice("Unpublished — the link is dead.");
       } else setNotice(j.error || "Could not unpublish.");
     } catch {
@@ -287,6 +289,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       setPid(j.project.id);
       setReport(null);
       setPubUrl("");
+    setSnaps([]);
       setReqs([]);
       setQuestions([]);
       setAnswers({});
@@ -373,6 +376,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     setRunStatus("running");
     setReport(null);
     setPubUrl("");
+    setSnaps([]);
     let runId = "";
     let streamTok = "";
     try {
@@ -479,6 +483,28 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     } catch {
       /* offline */
     }
+    try {
+      const r = await api(`/api/projects/${p}/snapshots`);
+      const j = await r.json();
+      setSnaps(j.ok ? j.snapshots || [] : []);
+    } catch {
+      /* offline */
+    }
+  }
+
+  async function restoreSnap(at: string) {
+    if (!pid) return;
+    if (!window.confirm(`Restore snapshot ${at}? Current files it covers will be replaced.`)) return;
+    setBusy("Restoring…");
+    try {
+      const r = await api(`/api/projects/${pid}/snapshots/${at}/restore`, { method: "POST" });
+      const j = await r.json();
+      setNotice(j.ok ? `Restored ${j.restored} file(s) from ${j.at}.` : j.error || "Restore failed.");
+      refreshTree();
+    } catch {
+      setNotice("Restore failed — backend offline?");
+    }
+    setBusy("");
   }
 
   async function fetchDashboard() {
@@ -519,6 +545,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
           setPid("");
           setReport(null);
           setPubUrl("");
+    setSnaps([]);
           setFiles([]);
         }
         setNotice("Deleted.");
@@ -538,6 +565,8 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     setPid(id);
     setReport(null);
     setPubUrl("");
+    setSnaps([]);
+    setSnaps([]);
     setReqs([]);
     setQuestions([]);
     setAnswers({});
@@ -926,6 +955,13 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
           </p>
         )}
         {sel && <pre className="out" style={{ maxHeight: 320, overflow: "auto" }}>{code.slice(0, 8000) || "(empty)"}</pre>}
+        {snaps.length > 0 && (
+          <p className="prose"><span className="hl">snapshots</span> pre-build safety copies — restore any:{" "}
+            {snaps.map((s) => (
+              <span key={s.at}><button type="button" className="btn" style={{ margin: "0 8px 8px 0", fontSize: 12 }} onClick={() => restoreSnap(s.at)}>↩ {s.at} ({s.files})</button></span>
+            ))}
+          </p>
+        )}
         {report?.preview_url && !pubUrl && (
           <div style={{ marginTop: 16 }}>
             <p className="prose"><span className="hl">live preview</span> {report.preview_url} (runs while this build lives)</p>
@@ -950,7 +986,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       </section>
       <section>
         <h2 className="sect">6 · Bring your own project</h2>
-        <p className="prose"><strong>Upload a ZIP</strong> — inspected safely, never overwriting without permission.</p>
+        <p className="prose"><strong>Upload a ZIP</strong> — inspected safely, extracted over your files. Every build first saves a snapshot (see §5) — your code is never lost, restore any snapshot in one click.</p>
         <p><input type="file" accept=".zip" onChange={upload} aria-label="Upload ZIP project" /></p>
         <p className="prose" style={{ marginTop: 16 }}><strong>Connect GitHub</strong> — public repos clone free, no account. Pushing needs your approval + token. Account OAuth is not built; the API says so honestly.</p>
         <p>

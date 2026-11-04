@@ -186,12 +186,14 @@ def _is_model_missing(error: str) -> bool:
 
 
 def generate_with_model(spec: str, requirements: list,
-                        client=None, router=None, on_progress=None) -> dict:
+                        client=None, router=None, on_progress=None,
+                        existing: str = "") -> dict:
     """Ask the model to write the app. The model designs everything from
-    the spec + requirements — no keyword steering reaches it. Returns a
-    result dict, never raises for model-side problems (callers fall back
-    to templates on ok=False). When on_progress is given (and no test
-    router is injected), generation streams and on_progress(chars,
+    the spec + requirements — no keyword steering reaches it. `existing`
+    carries current project files to modify/extend ("" = fresh build).
+    Returns a result dict, never raises for model-side problems (callers
+    fall back to templates on ok=False). When on_progress is given (and
+    no test router is injected), generation streams and on_progress(chars,
     elapsed_s) fires as tokens arrive — throttled by the caller."""
     try:
         from ..intelligence.meta_client import MetaClient, MetaConfig
@@ -227,6 +229,7 @@ def generate_with_model(spec: str, requirements: list,
         _, prompt = render("codegen.fullstack", {
             "spec": spec,
             "requirements": req_lines,
+            "existing": existing or "(none — fresh project)",
         })
         tried: list = []
         if use_stream:

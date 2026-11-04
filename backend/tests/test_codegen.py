@@ -76,7 +76,7 @@ def test_codegen_prompt_requires_sandbox_bind():
     require GENESIS_BIND honoring with a 127.0.0.1 default."""
     from app.intelligence.prompt_manager import render
     version, prompt = render("codegen.fullstack", {
-        "spec": "s", "requirements": "- R: x"})
+        "spec": "s", "requirements": "- R: x", "existing": ""})
     assert version == "v2"
     assert "GENESIS_BIND" in prompt
     assert "UNREACHABLE" in prompt
@@ -93,7 +93,7 @@ def test_codegen_prompt_has_no_keyword_steering():
                    "AUTH:", "GAME:"):
         assert banned not in template, banned
     _, prompt = render("codegen.fullstack", {
-        "spec": "s", "requirements": "- R: x"})
+        "spec": "s", "requirements": "- R: x", "existing": ""})
     assert "DESIGN the app yourself" in prompt
 
 

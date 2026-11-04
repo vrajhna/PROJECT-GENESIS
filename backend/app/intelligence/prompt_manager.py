@@ -40,6 +40,10 @@ PROMPTS: dict[str, dict[str, str]] = {
                "Keep every file small and complete. Total output under 60KB."),
         "v2": ("You are Genesis, an autonomous software engineer. Read the SPECIFICATION and REQUIREMENTS and DESIGN the app yourself — you decide the data model, API routes, pages, and UI, like an engineer handed a client brief. No other steering is given; think from the spec text. Write a COMPLETE small full-stack app as a JSON file map. Output ONLY JSON, no prose, no fences: {{\"files\": {{\"<path>\": \"<content>\", ...}}}}.\n\n"
                "SPECIFICATION:\n{spec}\n\nREQUIREMENTS:\n{requirements}\n\n"
+               "EXISTING PROJECT FILES (empty means a fresh project — build from scratch):\n{existing}\n\n"
+               "When EXISTING PROJECT FILES are non-empty: MODIFY and EXTEND that code to satisfy the spec. "
+               "Keep every file that already works; change only what the spec requires; never reinvent or delete "
+               "user logic. New files only where nothing suitable exists.\n\n"
                "CONTRACT (every generated app must obey it — a test harness will execute it):\n"
                "1. backend/server.py — Python STDLIB ONLY (http.server, sqlite3, json, hashlib, secrets, urllib.parse). No pip packages.\n"
                "   Binds GENESIS_BIND env if set else 127.0.0.1 — write the bind host EXACTLY as os.environ.get(\"GENESIS_BIND\", \"127.0.0.1\") (the Genesis sandbox sets GENESIS_BIND=0.0.0.0 inside its disposable container, which is still published only on host loopback — a loopback-only bind inside the container is UNREACHABLE and fails verification), port from argv --port or GENESIS_APP_PORT env (default 8000). SQLite file backend/app.db next to the script.\n"

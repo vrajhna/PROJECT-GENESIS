@@ -1401,6 +1401,66 @@ def unpublish_project(pid: str, request: Request):
     return {"ok": True, "unpublished": True}
 
 
+SNAP_RE = re.compile(r"^[0-9]{8}T[0-9]{6}$")
+
+
+@app.get("/api/projects/{pid}/snapshots")
+def list_snapshots(pid: str, request: Request):
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
+    out = []
+    base = proj_dir(pid) / "work" / ".genesis" / "snapshots"
+    try:
+        for d in sorted(base.iterdir(), reverse=True):
+            if d.is_dir() and SNAP_RE.match(d.name):
+                n = sum(1 for _ in d.rglob("*") if _.is_file())
+                out.append({"at": d.name, "files": n})
+    except OSError:
+        pass
+    return {"ok": True, "snapshots": out}
+
+
+@app.post("/api/projects/{pid}/snapshots/{ts}/restore")
+def restore_snapshot(pid: str, ts: str, request: Request):
+    import shutil
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
+    if not SNAP_RE.match(ts or ""):
+        return err(request, "bad snapshot id", 400)
+    work = proj_dir(pid) / "work"
+    src = work / ".genesis" / "snapshots" / ts
+    try:
+        if not src.resolve().parent == (work / ".genesis" / "snapshots").resolve():
+            return err(request, "bad snapshot id", 400)
+    except OSError:
+        return err(request, "unknown snapshot", 404)
+    if not src.is_dir():
+        return err(request, "unknown snapshot", 404)
+    restored = 0
+    for f in sorted(src.rglob("*")):
+        if not f.is_file():
+            continue
+        try:
+            rel = f.relative_to(src)
+        except ValueError:
+            continue
+        if rel.parts and rel.parts[0] in (".venv", ".genesis", "__pycache__",
+                                          "node_modules", ".git"):
+            continue
+        try:
+            target = (work / rel).resolve()
+            if target != work.resolve() and work.resolve() not in target.parents:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(f.read_bytes())
+            restored += 1
+        except OSError:
+            continue
+    return {"ok": True, "restored": restored, "at": ts}
+
+
 @app.get("/p/{slug}")
 def published_root(slug: str):
     from fastapi.responses import RedirectResponse

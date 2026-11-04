@@ -1072,6 +1072,15 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
     report["flappy"] = flappy
 
     from ..builder.files import GenesisWorkspace, clear_generated_files
+    from ..builder.files import collect_existing_context, snapshot_project
+    # Snapshot user files BEFORE generate (restorable from §6/files);
+    # collect them as model context so improve builds extend, not erase.
+    snap = snapshot_project(workdir)
+    report["snapshot"] = snap
+    if snap.get("files"):
+        decisions.append({"decision": f"snapshot: {snap['files']} file(s) saved before generate",
+                          "reason": "Your code is safe — restore any snapshot from the API if a build goes wrong."})
+    existing_ctx = collect_existing_context(workdir)
     # Remove prior template-mode outputs (marker-gated: user files never match).
     clear_generated_files(workdir, ["solution.py", "test_solution.py",
                                     "app_server.py", "test_server.py"])
@@ -1135,7 +1144,8 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
 
     try:
         from ..builder.codegen import generate_with_model
-        gen = generate_with_model(spec, reqs, on_progress=_gen_progress)
+        gen = generate_with_model(spec, reqs, on_progress=_gen_progress,
+                                  existing=existing_ctx)
         if gen.get("ok"):
             model_files = gen["files"]
             author = (f"author: model {gen.get('model')} "
