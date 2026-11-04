@@ -489,6 +489,21 @@ SESSION_COOKIE = "genesis_session"
 CSRF_HEADER = "x-genesis-csrf"
 
 
+def _cookie_secure(request: Request) -> bool:
+    """Secure flag for the session cookie. SameSite=None is REJECTED by
+    browsers without Secure — and behind proxies the scheme/proto headers
+    are unreliable, so real (non-local) hostnames always get Secure.
+    Localhost/test hosts stay plain so laptop mode keeps working."""
+    try:
+        proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+        if proto == "https" or request.url.scheme == "https":
+            return True
+        host = (request.url.hostname or "").lower()
+        return host not in ("localhost", "127.0.0.1", "::1", "testserver", "")
+    except Exception:
+        return False
+
+
 def _cookie_token(request: Request) -> str:
     try:
         return str(request.cookies.get(SESSION_COOKIE) or "")
@@ -595,16 +610,10 @@ def auth_verify(body: AuthVerifyIn, request: Request):
         return err(request, e.message, e.status)
     resp = JSONResponse({"ok": True, "token": out["token"],
                          "member": out["member"], "new": out["new"]})
-    secure = ""
-    try:
-        proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
-        if proto == "https" or request.url.scheme == "https":
-            secure = "; Secure"
-    except Exception:
-        pass
-    resp.headers["set-cookie"] = (
-        f"{SESSION_COOKIE}={out['token']}; HttpOnly; SameSite=None{secure}; "
-        f"Path=/; Max-Age={30 * 24 * 3600}")
+    resp.set_cookie(SESSION_COOKIE, out["token"], max_age=30 * 24 * 3600,
+                    path="/", httponly=True,
+                    samesite="none" if _cookie_secure(request) else "lax",
+                    secure=_cookie_secure(request))
     return resp
 
 
@@ -620,8 +629,9 @@ def auth_me(request: Request):
 def auth_logout(request: Request):
     accounts.logout(_bearer(request) or _cookie_token(request))
     resp = JSONResponse({"ok": True})
-    resp.headers["set-cookie"] = (
-        f"{SESSION_COOKIE}=; HttpOnly; SameSite=None; Path=/; Max-Age=0")
+    resp.set_cookie(SESSION_COOKIE, "", max_age=0, path="/", httponly=True,
+                    samesite="none" if _cookie_secure(request) else "lax",
+                    secure=_cookie_secure(request))
     return resp
 
 
@@ -968,7 +978,8 @@ def build_fullstack_app(pid: str, request: Request, body: FullstackIn | None = N
             return rep
 
         run_id = runstore.start_run(pid, "fullstack", _run_fullstack)
-        return {"ok": True, "run_id": run_id}
+        return {"ok": True, "run_id": run_id,
+                "stream_token": runstore.stream_token(run_id)}
     report = build_fullstack(meta["spec"], workdir, answers=chosen)
     save_report(pid, report)
     return {"ok": report["verdict"] == "VERIFIED", "report": report}
@@ -992,11 +1003,15 @@ def build_status(pid: str, request: Request, run_id: str = ""):
 
 
 @app.get("/api/projects/{pid}/build/stream")
-def build_stream(pid: str, request: Request, run_id: str = ""):
+def build_stream(pid: str, request: Request, run_id: str = "",
+                 stoken: str = ""):
     from ..orchestrator import runs as runstore
-    me, error = need_member(request)
-    if error is not None:
-        return error
+    # Auth: session (cookie/Bearer) OR the run-scoped stream token —
+    # EventSource cannot send headers, and cookie availability varies.
+    if not runstore.check_stream_token(run_id, stoken):
+        me, error = need_member(request)
+        if error is not None:
+            return error
     run = runstore.get_run(run_id)
     if not run or run["pid"] != pid:
         return err(request, "unknown run", 404)
@@ -1017,8 +1032,8 @@ def build_stream(pid: str, request: Request, run_id: str = ""):
                     "status": snap["status"], "report": snap["report"],
                     "error": snap["error"]}) + "\n\n")
                 break
-            runstore.wait_done(run_id, timeout=20)
-            time.sleep(1)
+            runstore.wait_done(run_id, timeout=10)
+            yield ": hb\n\n"  # heartbeat: proxies kill silent SSE connections
     return StreamingResponse(events(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
@@ -1100,8 +1115,9 @@ def download_engine():
 
 @app.get("/api/projects/{pid}/report")
 def get_report(pid: str, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     report = load_report(pid)
     if report is None:
         return err(request, "no build yet", 404)
@@ -1109,9 +1125,10 @@ def get_report(pid: str, request: Request):
 
 
 @app.get("/api/runs/{pid}/events")
-def run_events(pid: str):
-    if load_project(pid) is None:
-        return JSONResponse({"ok": False, "error": "unknown project"}, status_code=404)
+def run_events(pid: str, request: Request):
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     report = load_report(pid)
     steps = report.get("steps", []) if isinstance(report, dict) else []
 

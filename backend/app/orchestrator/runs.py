@@ -71,6 +71,10 @@ def _new_run(pid: str, kind: str) -> dict:
         "error": "",
         "started_at": int(time.time()),
         "done": threading.Event(),
+        # Run-scoped stream credential: EventSource cannot send headers,
+        # so SSE auth uses this token (bound to this run only) when the
+        # session cookie is unavailable for any reason.
+        "stoken": uuid.uuid4().hex + uuid.uuid4().hex[:8],
     }
 
 
@@ -152,3 +156,16 @@ def wait_done(run_id: str, timeout: float = 20.0) -> bool:
     if not run:
         return True
     return run["done"].wait(timeout=timeout)
+
+
+def stream_token(run_id: str) -> str:
+    run = _live_run(run_id)
+    return str(run.get("stoken") or "") if run else ""
+
+
+def check_stream_token(run_id: str, token: str) -> bool:
+    run = _live_run(run_id)
+    if not run or not token:
+        return False
+    import hmac as _hmac
+    return _hmac.compare_digest(str(run.get("stoken") or ""), str(token))

@@ -374,6 +374,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     setReport(null);
     setPubUrl("");
     let runId = "";
+    let streamTok = "";
     try {
       const r = await api(`/api/projects/${pid}/fullstack?stream=true`, {
         method: "POST",
@@ -383,18 +384,59 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       const j = await r.json();
       if (!j.ok || !j.run_id) throw new Error(j.error || "stream start failed");
       runId = j.run_id;
+      streamTok = j.stream_token || "";
     } catch {
       setRunStatus("idle");
       return setNotice("Could not start the live build — is the backend still running?");
     }
     setBusy("Building live — agents working in parallel. Watch §4.");
     await new Promise<void>((resolve) => {
-      const es = new EventSource(`${API}/api/projects/${pid}/build/stream?run_id=${runId}`);
-      try {
-        (es as any).withCredentials = true;
-      } catch {
-        /* ignore */
-      }
+      let settled = false;
+      const finish = (report: any, failedMsg?: string) => {
+        if (settled) return;
+        settled = true;
+        try {
+          es.close();
+        } catch {
+          /* ignore */
+        }
+        if (report) {
+          setReport(report);
+          setRunStatus("done");
+          setNotice(noticeFor(report, true));
+        } else {
+          setRunStatus("failed");
+          setNotice("Build failed: " + (failedMsg || "see server log"));
+        }
+        refreshTree();
+        setBusy("");
+        resolve();
+      };
+      // Polling fallback: if the SSE feed dies (proxy, restart, browser),
+      // the build result still arrives via status/report polling.
+      const pollFallback = async () => {
+        for (let i = 0; i < 160 && !settled; i++) {
+          await new Promise((r) => setTimeout(r, 3000));
+          if (settled) return;
+          try {
+            const s = await (await api(`/api/projects/${pid}/build/status?run_id=${runId}`)).json();
+            if (s.ok && s.run) {
+              if (Array.isArray(s.run.steps)) setRunSteps(s.run.steps);
+              if (s.run.status === "done" && s.run.report) return finish(s.run.report);
+              if (s.run.status === "failed") return finish(null, s.run.error || "see server log");
+              continue;
+            }
+            // run unknown (server restarted): the saved report still lands
+            const rep = await (await api(`/api/projects/${pid}/report`)).json();
+            if (rep.ok && rep.report) return finish(rep.report);
+            return finish(null, "run lost (server restarted) — press Build full app again");
+          } catch {
+            /* keep polling */
+          }
+        }
+        if (!settled) finish(null, "timed out waiting for the build — check §5 files or rebuild");
+      };
+      const es = new EventSource(`${API}/api/projects/${pid}/build/stream?run_id=${runId}&stoken=${encodeURIComponent(streamTok)}`, { withCredentials: true });
       esRef.current = es;
       es.addEventListener("step", (ev) => {
         try {
@@ -408,25 +450,11 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       es.addEventListener("done", (ev) => {
         try {
           const d = JSON.parse((ev as MessageEvent).data);
-          if (d.status === "done" && d.report) {
-            setReport(d.report);
-            setRunStatus("done");
-            setNotice(noticeFor(d.report, true));
-          } else {
-            setRunStatus("failed");
-            setNotice("Build failed: " + (d.error || "see server log"));
-          }
+          if (d.status === "done" && d.report) finish(d.report);
+          else finish(null, d.error || "see server log");
         } catch {
-          setRunStatus("failed");
+          finish(null, "stream ended unexpectedly");
         }
-        try {
-          es.close();
-        } catch {
-          /* ignore */
-        }
-        refreshTree();
-        setBusy("");
-        resolve();
       });
       es.onerror = () => {
         try {
@@ -434,10 +462,10 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
         } catch {
           /* ignore */
         }
-        setRunStatus("idle");
-        setBusy("");
-        setNotice("Stream dropped — the build may still finish; press Build full app again to retry live.");
-        resolve();
+        if (!settled) {
+          setNotice("Live feed dropped — following the build by polling…");
+          void pollFallback();
+        }
       };
     });
   }

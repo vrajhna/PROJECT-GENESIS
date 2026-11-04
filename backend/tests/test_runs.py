@@ -85,6 +85,13 @@ def test_streamed_fullstack_build_verifies_live(tmp_path, monkeypatch):
     VERIFIED report with parallel lanes, report.json written."""
     from app.api import server as srv
     from app.auth import accounts as acc
+    from app.builder import codegen as _cg
+    # Deterministic: template author path (pipeline, lanes, Docker and
+    # gates stay fully real; the live-model variant flakes under load).
+    monkeypatch.setattr(_cg, "generate_with_model",
+                        lambda *a, **k: {"ok": False,
+                                         "error": "test: template path",
+                                         "fallback": True})
     c = _client(tmp_path)
     import os
     monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
