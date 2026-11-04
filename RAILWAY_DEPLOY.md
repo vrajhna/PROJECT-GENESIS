@@ -71,8 +71,14 @@ HTTPS certificates are issued automatically.)
 
 ## 6. Notes
 
-- One API worker for now (default uvicorn). Build queue + shared
-  gate/rate store is the next milestone before adding workers.
-- Generated projects live on the `/data` Volume (same pattern as WebStudio).
+- One API worker for now (default uvicorn). Build queue is the next
+  milestone before adding workers; run snapshots already persist to
+  Postgres for history and cross-worker reads.
+- Website state (accounts, sessions, projects, reports, runs, memory,
+  rate limits, publishes) lives in Postgres — no file fallback when
+  `GENESIS_REQUIRE_DB=1`. Only execution workspaces (build trees,
+  Docker contexts, published static copies, ZIPs) live on the `/data`
+  Volume. Laptop/terminal use (no `DATABASE_URL`, flag unset) keeps
+  full file authority with no login.
 - Local dev is unchanged: `:8000` + `:3101` with `GENESIS_DATA_DIR` unset
   (files) or `DATABASE_URL` set (tables).

@@ -145,6 +145,80 @@ def kv_set(conn, key: str, value) -> None:
         cur.close()
 
 
+def kv_delete(conn, key: str) -> None:
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM genesis_kv WHERE k = %s", (key,))
+        conn.commit()
+    finally:
+        cur.close()
+
+
+PROJECT_KEY_PREFIX = "project:"
+
+
+def _as_json(value):
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+def project_save(conn, meta: dict) -> dict:
+    """Website system of record for one project (Postgres, no files)."""
+    doc = dict(meta or {})
+    doc["updated"] = time.time()
+    kv_set(conn, PROJECT_KEY_PREFIX + str(doc.get("id") or ""), doc)
+    return doc
+
+
+def project_get(conn, pid: str):
+    return kv_get(conn, PROJECT_KEY_PREFIX + str(pid or ""))
+
+
+def project_list(conn) -> list[dict]:
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT v FROM genesis_kv WHERE k LIKE 'project:%'")
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+    out = []
+    for row in rows or []:
+        doc = _as_json(row[0]) if row else None
+        if isinstance(doc, dict) and doc.get("id"):
+            out.append(doc)
+    return sorted(out, key=lambda d: d.get("updated") or 0, reverse=True)
+
+
+def project_delete(conn, pid: str) -> None:
+    kv_delete(conn, PROJECT_KEY_PREFIX + str(pid or ""))
+    kv_delete(conn, "report:" + str(pid or ""))
+
+
+def report_save(conn, pid: str, report: dict) -> None:
+    kv_set(conn, "report:" + str(pid or ""), report or {})
+
+
+def report_get(conn, pid: str):
+    return kv_get(conn, "report:" + str(pid or ""))
+
+
+def run_save(conn, run: dict) -> dict:
+    """Persisted run snapshot for history and cross-worker reads."""
+    doc = dict(run or {})
+    doc["updated_at"] = time.time()
+    doc.pop("done", None)
+    kv_set(conn, "run:" + str(doc.get("id") or ""), doc)
+    return doc
+
+
+def run_get(conn, run_id: str):
+    return kv_get(conn, "run:" + str(run_id or ""))
+
+
 def hit(conn, ip: str, now: float) -> None:
     cur = conn.cursor()
     try:

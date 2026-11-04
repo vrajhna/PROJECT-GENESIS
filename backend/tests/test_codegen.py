@@ -75,11 +75,26 @@ def test_codegen_prompt_requires_sandbox_bind():
     container is unreachable from the host (proven live). The contract must
     require GENESIS_BIND honoring with a 127.0.0.1 default."""
     from app.intelligence.prompt_manager import render
-    _, prompt = render("codegen.fullstack", {
-        "spec": "s", "requirements": "- R: x", "resources": "item",
-        "auth": "off", "game": "none"})
+    version, prompt = render("codegen.fullstack", {
+        "spec": "s", "requirements": "- R: x"})
+    assert version == "v2"
     assert "GENESIS_BIND" in prompt
     assert "UNREACHABLE" in prompt
+    assert 'os.environ.get("GENESIS_BIND", "127.0.0.1")' in prompt
+
+
+def test_codegen_prompt_has_no_keyword_steering():
+    """The model designs from spec + requirements alone. No keyword-derived
+    steering (resources/auth/game) may reach the generation prompt."""
+    from app.intelligence.prompt_manager import get_prompt, render
+    version, template = get_prompt("codegen.fullstack")
+    assert version == "v2"
+    for banned in ("{resources}", "{auth}", "{game}", "RESOURCES:",
+                   "AUTH:", "GAME:"):
+        assert banned not in template, banned
+    _, prompt = render("codegen.fullstack", {
+        "spec": "s", "requirements": "- R: x"})
+    assert "DESIGN the app yourself" in prompt
 
 
 def test_ok_path_uses_wonder_and_records_author():
@@ -94,7 +109,7 @@ def test_ok_path_uses_wonder_and_records_author():
 def generate(**kw):
     return codegen.generate_with_model(
         "Build me a flappy game", [{"id": "REQ-001", "description": "flap"}],
-        ["score"], False, "flappy", **kw)
+        **kw)
 
 
 def test_model_not_found_falls_back_to_primary_then_writes():
@@ -132,7 +147,7 @@ def test_no_key_falls_back_without_network():
     cfg = MetaConfig(api_key="", base_url="https://api.meta.ai/v1",
                      primary_model="muse-spark-1.3",
                      advanced_model="muse-wonder-1.0")
-    out = codegen.generate_with_model("spec", [], [], False, "none",
+    out = codegen.generate_with_model("spec", [],
                                       client=MetaClient(cfg))
     assert out["ok"] is False and out["fallback"] is True
 
@@ -178,6 +193,38 @@ def test_localhost_bind_required():
     assert out["ok"] is False and "localhost" in out["error"]
 
 
+def test_hardcoded_loopback_bind_is_adapted_not_rejected():
+    """Wonder ignored the GENESIS_BIND prose (proven live: hardcoded
+    127.0.0.1, unreachable in Docker). The pipeline adapts the bind
+    deterministically instead of failing the model path."""
+    files = dict(GOOD_FILES)
+    files["backend/server.py"] = (
+        "import sys\n"
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
+        "\n"
+        "class H(BaseHTTPRequestHandler):\n"
+        "    pass\n"
+        "\n"
+        "ThreadingHTTPServer((\"127.0.0.1\", 8000), H).serve_forever()\n"
+    )
+    adapted, flag = codegen.ensure_sandbox_bind(files)
+    assert flag is True
+    server = adapted["backend/server.py"]
+    assert 'os.environ.get("GENESIS_BIND", "127.0.0.1")' in server
+    assert server.startswith("import os\n")
+    compile(server, "server.py", "exec")
+    out = generate(router=FakeRouter(script=[(True, _payload(files), "muse-wonder-1.0")]))
+    assert out["ok"] is True
+    assert out.get("normalized_bind") is True
+
+
+def test_server_without_any_bind_is_rejected():
+    files = dict(GOOD_FILES)
+    files["backend/server.py"] = "# no server here\nprint('hi')\n"
+    out = generate(router=FakeRouter(script=[(True, _payload(files), "muse-wonder-1.0")]))
+    assert out["ok"] is False and "GENESIS_BIND" in out["error"]
+
+
 def test_extract_text_shapes():
     assert codegen.extract_text(
         {"output": [{"content": [{"type": "output_text",
@@ -193,8 +240,7 @@ def test_live_wonder_writes_an_app():
     out = codegen.generate_with_model(
         "Build a tiny click-counter page with a reset button.",
         [{"id": "REQ-001", "description": "button increments a number"},
-         {"id": "REQ-002", "description": "reset button zeroes it"}],
-        [], False, "none")
+         {"id": "REQ-002", "description": "reset button zeroes it"}])
     assert out["ok"] is True, out.get("error")
     assert "wonder" in out["model"]
 

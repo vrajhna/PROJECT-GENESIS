@@ -334,7 +334,8 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
         body: JSON.stringify({ message: text }),
       });
       const j = await r.json();
-      setChat((c) => [...c, { who: "genesis", text: j.reply }]);
+      const extra = j.model_error ? ` (Model unavailable: ${j.model_error})` : "";
+      setChat((c) => [...c, { who: "genesis", text: `${j.reply}${extra}` }]);
       if (j.requirements) setReqs(j.requirements);
     } catch {
       setChat((c) => [...c, { who: "genesis", text: "Backend is offline. Start it and try again." }]);
@@ -399,6 +400,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
         try {
           const st = JSON.parse((ev as MessageEvent).data);
           setRunSteps((prev) => [...prev, st]);
+          if (st.step === "file") refreshTree();
         } catch {
           /* ignore */
         }

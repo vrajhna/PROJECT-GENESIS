@@ -213,13 +213,90 @@ def test_live_postgres_roundtrip():
         assert pg.exp_confirm(con, "exp-test-1") is True
         rows = pg.exp_query(con, project="test", verified_only=True)
         assert any(r["id"] == "exp-test-1" for r in rows)
+        saved = pg.project_save(con, {"id": "proj-live-1", "name": "Live",
+                                      "owner_email": "t@x.co"})
+        assert saved["updated"] > 0
+        assert pg.project_get(con, "proj-live-1")["name"] == "Live"
+        assert "proj-live-1" in [d["id"] for d in pg.project_list(con)]
+        pg.report_save(con, "proj-live-1", {"verdict": "VERIFIED"})
+        assert pg.report_get(con, "proj-live-1")["verdict"] == "VERIFIED"
+        pg.run_save(con, {"id": "run-live-1", "pid": "proj-live-1",
+                          "kind": "fullstack", "status": "done", "steps": [],
+                          "report": {"verdict": "VERIFIED"}, "error": "",
+                          "started_at": 1})
+        assert pg.run_get(con, "run-live-1")["status"] == "done"
+        pg.project_delete(con, "proj-live-1")
+        assert pg.project_get(con, "proj-live-1") is None
+        assert pg.report_get(con, "proj-live-1") is None
     finally:
         cur = con.cursor()
         try:
             cur.execute("DELETE FROM genesis_kv WHERE k = 'genesis-test-kv'")
             cur.execute("DELETE FROM genesis_hits WHERE ip = 'test-ip'")
             cur.execute("DELETE FROM genesis_experience WHERE id = 'exp-test-1'")
+            cur.execute("DELETE FROM genesis_kv WHERE k LIKE 'project:proj-live-%'")
+            cur.execute("DELETE FROM genesis_kv WHERE k LIKE 'report:proj-live-%'")
+            cur.execute("DELETE FROM genesis_kv WHERE k LIKE 'run:run-live-%'")
             con.commit()
         finally:
             cur.close()
             con.close()
+
+
+def test_kv_delete_shape():
+    cur = FakeCursor()
+    con = FakeConn(cur)
+    pg.kv_delete(con, "project:gone")
+    sql, params = cur.statements[-1]
+    assert sql == "DELETE FROM genesis_kv WHERE k = %s"
+    assert params == ("project:gone",)
+    assert con.commits == 1
+
+
+def test_project_save_get_list_delete_shapes():
+    cur = FakeCursor(fetchone=('{"id": "proj-1", "updated": 3}',))
+    con = FakeConn(cur)
+    saved = pg.project_save(con, {"id": "proj-1", "name": "A"})
+    assert saved["id"] == "proj-1"
+    assert saved["updated"] > 0
+    sql, params = cur.statements[-1]
+    assert "INSERT INTO genesis_kv" in sql
+    assert params[0] == "project:proj-1"
+    assert json.loads(params[1])["name"] == "A"
+
+    assert pg.project_get(con, "proj-1") == {"id": "proj-1", "updated": 3}
+    sql, params = cur.statements[-1]
+    assert sql.startswith("SELECT v FROM genesis_kv")
+    assert params == ("project:proj-1",)
+
+    rows = FakeCursor(fetchall=[
+        ('{"id": "old", "updated": 1}',),
+        ('{"id": "new", "updated": 5}',),
+        ("not-json",),
+        (None,),
+    ])
+    listed = pg.project_list(FakeConn(rows))
+    assert [d["id"] for d in listed] == ["new", "old"]
+    assert rows.statements[0][0] == (
+        "SELECT v FROM genesis_kv WHERE k LIKE 'project:%'")
+
+    gone = FakeCursor()
+    pg.project_delete(FakeConn(gone), "proj-1")
+    assert [p for _, p in gone.statements] == [
+        ("project:proj-1",), ("report:proj-1",)]
+
+
+def test_report_and_run_shapes():
+    cur = FakeCursor(fetchone=('{"verdict": "VERIFIED"}',))
+    con = FakeConn(cur)
+    pg.report_save(con, "proj-1", {"verdict": "VERIFIED"})
+    sql, params = cur.statements[-1]
+    assert params[0] == "report:proj-1"
+    assert pg.report_get(con, "proj-1") == {"verdict": "VERIFIED"}
+
+    saved = pg.run_save(con, {"id": "run-1", "pid": "proj-1",
+                              "status": "done", "steps": [], "done": object()})
+    assert "done" not in saved
+    assert saved["updated_at"] > 0
+    sql, params = cur.statements[-1]
+    assert params[0] == "run:run-1"

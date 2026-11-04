@@ -35,10 +35,23 @@ def _git(repo: Path, *args: str, timeout_s: int = 60) -> subprocess.CompletedPro
                           text=True, timeout=timeout_s, shell=False)
 
 
+_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
+
+
+def _ref_ok(name: str) -> bool:
+    """Branch/ref names that can never be mistaken for a git flag or a
+    rev range. Leading dash banned (flag injection), '..' banned (ranges),
+    '~^:?*[' never match (reflog/pathspect magic)."""
+    return (isinstance(name, str) and ".." not in name
+            and _REF_RE.fullmatch(name) is not None)
+
+
 def clone(url: str, dest: Path, branch: str | None = None) -> dict:
     parsed = parse_repo_url(url)
     if not parsed.get("ok", True) and parsed.get("kind") != "local":
         return parsed
+    if branch and not _ref_ok(branch):
+        return {"ok": False, "error": "invalid branch name"}
     if dest.exists() and any(dest.iterdir()):
         return {"ok": False, "error": "destination is not empty (refusing to overwrite)"}
     dest.mkdir(parents=True, exist_ok=True)
@@ -65,7 +78,7 @@ def list_branches(repo: Path) -> dict:
 
 
 def create_branch(repo: Path, name: str) -> dict:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}", name):
+    if not _ref_ok(name):
         return {"ok": False, "error": "invalid branch name"}
     proc = _git(repo, "checkout", "-b", name)
     if proc.returncode != 0:
@@ -74,6 +87,8 @@ def create_branch(repo: Path, name: str) -> dict:
 
 
 def diff_summary(repo: Path, base: str = "HEAD") -> dict:
+    if not _ref_ok(base):
+        return {"ok": False, "error": "invalid diff base"}
     stat = _git(repo, "diff", "--stat", base)
     names = _git(repo, "diff", "--name-only", base)
     if stat.returncode != 0:
@@ -95,6 +110,8 @@ def push(repo: Path, branch: str, approved: bool = False) -> dict:
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
         return {"ok": False, "error": "GITHUB_TOKEN is not set; cannot push"}
+    if not _ref_ok(branch):
+        return {"ok": False, "error": "invalid branch name"}
     proc = _git(repo, "push", "origin", branch)
     if proc.returncode != 0:
         return {"ok": False, "error": proc.stderr.strip()[-500:]}

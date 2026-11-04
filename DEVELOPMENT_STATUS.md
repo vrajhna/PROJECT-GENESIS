@@ -672,3 +672,147 @@
   `done` + VERIFIED. New bundle verified serving (`live crew` +
   `EventSource` in the client JS, HTTP 200).
 - Typecheck + build clean.
+
+## 2026-11-04 — Stage 4: Docker sandbox wired and proven
+
+- Wired `app/sandbox/docker_runner.py` into both builders:
+  `fullstack.py` initial start/restarts/stop/logs and `pipeline.py`
+  start/restarts/stop/logs/cleanup. Reports now carry `sandbox`.
+- Container profile: `python:3.12-slim`, non-root `1000:1000`, read-only
+  rootfs, `512MB/1CPU`, `pids-limit 128`, `cap-drop ALL`,
+  `no-new-privileges`, only `/tmp` writable, published on `127.0.0.1`.
+- Generated servers remain loopback-bound by default; containers receive
+  `GENESIS_BIND=0.0.0.0` so Docker port publishing works without changing
+  local/download behavior. The security scan accepts only this controlled
+  default and still rejects hard-coded world binds.
+- Fixed a real Docker syntax bug: `--no-new-privileges` is not a `docker
+  run` flag; runner now uses `--security-opt no-new-privileges`.
+- Live journey: created project `proj-c1d22ce2`, set blog spec, ran
+  `POST /api/projects/{pid}/fullstack`; result `VERIFIED`, 4 tests passed,
+  10 orchestration tasks done, sandbox labeled Docker, no `genesis-app`
+  containers left running. Persisted `report.json` and project files were
+  verified on disk.
+- Tests: `tests/test_sandbox.py` 4 passed; full backend suite
+  `151 passed, 2 skipped`, with only the 3 credential-dependent live-model
+  tests failing because the local Meta key remains revoked (`invalid_key`).
+  Restarted API by exact PID; new process verified healthy.
+
+## 2026-11-04 — Website strict persistence + Meta fix verified
+
+- STEP 1 diagnosis (chain traced live): frontend → API → Meta → agents →
+  tools → Docker → pytest → repair → report all execute for real. Found:
+  (1) Meta key was dead 401 (credential-side, now replaced — see below);
+  (2) website/server mode still kept projects/reports/runs/skills in
+  local files and runs in process memory, so "server mode" was not
+  really live; (3) `GENESIS_REQUIRE_DB=1` gated only `/api/health`;
+  (4) chat swallowed model errors silently.
+- Meta connectivity fixed and proven WITHOUT exposing the key: official
+  contract confirmed (`https://api.meta.ai/v1`, `Bearer MODEL_API_KEY`,
+  `GET /v1/models`, `POST /v1/responses`); live catalog lists 9 models
+  incl. `muse-wonder-1.0` + `muse-spark-1.3`; minimal generation
+  returned exactly `GENESIS-OK`. Old 401 was a revoked/never-valid key,
+  not an endpoint/auth-format bug. Env names: `MODEL_API_KEY`,
+  `META_BASE_URL`, `META_PRIMARY_MODEL`, `META_ADVANCED_MODEL`.
+- Website/laptop split enforced: `GENESIS_REQUIRE_DB=1` + `DATABASE_URL`
+  = website strict mode — projects/reports/runs/skills/publishes,
+  auth/sessions, memory, rate limits all in Postgres (`genesis_kv`
+  docs + existing tables), 503 with no file fallback when unreachable.
+  No `DATABASE_URL` + flag unset = laptop/terminal file authority, no
+  login. Execution workspaces stay on the managed `/data` volume in
+  both modes (build trees need a filesystem; the DB is the record).
+- Chat now returns `model_error` on failure; frontend shows it.
+  `/api/health` gains `store` + `require_db`; website settings refuse
+  SQLite and unverified Postgres URLs; editor disables SQLite in
+  website mode. Run snapshots persist to Postgres for history and
+  cross-worker reads (live SSE tail stays single-worker).
+- Acceptance: "Build a working task management application with a
+  frontend, backend and persistent database." → VERIFIED, 5 tests
+  passed, Wonder-authored (8 files), Docker-sandboxed, no repairs
+  needed. Agents that ran: Architect, Builder(via model), Tester
+  (real pytest), Reviewer, Secure; Debugger/Repair correctly idle.
+- Tests: new `tests/test_server_store.py` (7 routing tests) +
+  `test_pg_store.py` store shapes; live Postgres roundtrip (Docker,
+  real server) passed incl. projects/reports/runs; container removed.
+  Frontend typecheck + production build clean.
+- Full suite: `166 passed, 2 skipped, 1 failed` — the single failure
+  (`test_store_builds_verifies_and_persists`) passes alone with and
+  without the live key, and a rerun of the file failed a DIFFERENT
+  single test while the store test passed: transient live-model/infra
+  flake in the builder path, which this change does not touch (all
+  touched areas green). No test was weakened.
+- Still needs a human: Railway `DATABASE_URL` plugin reference,
+  `GENESIS_REQUIRE_DB=1`, SMTP vars, DNS CNAMEs, then rebuild frontend
+  with the public API base. Multi-worker build queue still future work.
+
+## 2026-11-04 — General loop: no steering + visible agents + CLI
+
+- LIVE DEPLOYMENT CHECK: editor
+  `genesis.webstudiobhiwadi.com` serves our frontend (chunk hashes match
+  the local build). API `genesis-api.webstudiobhiwadi.com` answers **502
+  Application failed to respond** — the hosted backend is down or never
+  booted (check Railway service status, start command honoring `$PORT`,
+  crash logs, env vars). It also predates all strict-mode/prompt work
+  below: redeploy after the revive.
+- DE-HARDCODE (user directive: fashion store was only an example — the
+  loop must build ANYTHING, like an engineer, not keyword templates):
+  `codegen.fullstack` prompt v2 gives the model spec + requirements
+  ONLY — no resources/auth/game steering (locked by
+  `test_codegen_prompt_has_no_keyword_steering`). Keyword signals now
+  route interview questions, the planner's stated reading, and offline
+  fallback templates only. Signature
+  `generate_with_model(spec, reqs)` updated at all call sites.
+- Model reliability: `respond()`/`respond_stream()` retry timeouts +
+  connection errors with the same bounded backoff as 5xx; codegen
+  window raised 120s → 300s after a real Wonder timeout on a store
+  build (loud `model_error` + template VERIFIED, never silent).
+- VISIBLE SIMULTANEOUS AGENTS (no fake cursors — every pixel is a real
+  event): `respond_stream` streams tokens with live chars/elapsed
+  progress beats over SSE; builder emits a `file` event per written
+  file; tester emits a `case` event per pytest verdict (`-v`); review
+  + secure already run concurrently (same-second lane timestamps).
+  Studio crew cards + feed animate from these; tree refreshes per file.
+- Generality proof: snake-game spec over the live stream → 34 events,
+  8 lanes, 14 model progress beats, 5 test cases → VERIFIED (template
+  fallback caught a malformed model JSON loudly; stream assembly then
+  hardened to delta-only + tested + live micro-stream proven exact).
+- CLI (was already 85% there — my earlier `ls` used the wrong path):
+  added `login` (OTP + `~/.genesis/token` 0600), `logout`, `talk` REPL,
+  `Authorization` on every call; new `/api/download/install.sh` +
+  `.ps1` endpoints for the bootstrap one-liner; `_zip_tree` returns
+  empty for missing packs (an empty zip is 22 truthy bytes — was a
+  lie); README rewritten with the one-command install + live links.
+  Proven live: `status`, `new`, `talk`, downloads all green.
+- Tests: 2 stream tests + 2 retry tests + no-steering test + 4 CLI
+  tests, all passing; full builder-affected subset re-run after the
+  final edits (see below).
+- NOT done (said plainly): the game demo got no art direction (it's a
+  disposable generality probe, not a deliverable); multi-model
+  providers stay post-submission per user call; public API revive +
+  redeploy needs the user's Railway access.
+
+## Pre-ship hardening + verification (2026-11-04)
+- Git ref guard (`access/github.py::_ref_ok`): clone/branch/diff/push
+  now reject refs starting with `-`, containing `..`, `~`, `^`, `:`,
+  whitespace, control chars, or `@{` — kills option-injection and
+  path-traversal via branch names. Covered in `test_access.py`.
+- OTP CSPRNG (`auth/accounts.py`): codes via `secrets.randbelow`
+  (6 digits, zero-padded), not `random`. Covered in test_accounts.
+- Terminal locked to laptop (`api/server.py`): non-playground terminal
+  + approve endpoints 403 in server mode (DATABASE_URL set); env
+  allowlist `TERM_, GENESIS_, PATH, HOME, LANG, LC_*, TZ` only (was
+  full `os.environ` incl. keys). Playground unaffected (own sandbox).
+  Covered: `test_terminal_blocked_in_server_mode` (+approve variant);
+  the two approval-flow tests now run in laptop mode explicitly.
+- Secret sweep: no `LLM_*`/key values in tracked code; only
+  `.env.example` tracked; `.env` gitignored.
+- Full suite: 178 passed + 2 skipped, 2 failed — both known transient
+  live-model flakes (`test_store_builds_verifies_and_persists`,
+  `test_streamed_fullstack_build_verifies_live`); rerun alone: 2/2
+  passed. Frontend `typecheck` + production `build` green.
+- Live journey on fresh servers (API health ok, Wonder+Spark valid):
+  notes-API spec → 3 reqs → 8 Wonder-authored files → pytest 16/16 →
+  retest confirm → VERIFIED; tree 15 entries; ZIP download 200
+  (11 entries, 10.8 KB). Evidence: proj-9ecf4148.
+- Live sites unverifiable from sandbox (no external net here): last
+  known editor 200 / API 502 — Railway revive + redeploy still needs
+  the user's access. Commit/push still awaiting explicit user say-so.

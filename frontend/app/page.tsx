@@ -728,9 +728,9 @@ function ModelsDoc() {
               <button type="button" className="btn primary" onClick={saveKey}>Connect key</button>
             </p>
           )}
-          <p className="prose"><span className="hl">database</span> {db ? `${db.engine} — ${db.live}.` : "querying engine…"}</p>
+          <p className="prose"><span className="hl">database</span> {db ? `${db.engine} — ${db.live}.` : "querying engine…"}{db?.require_db ? " Website mode requires PostgreSQL; SQLite stays laptop-only." : ""}</p>
           <p>
-            <button type="button" className={db?.engine === "sqlite" ? "btn primary" : "btn"} onClick={() => saveDb("sqlite")}>SQLite (zero setup)</button>{" "}
+            <button type="button" className={db?.engine === "sqlite" ? "btn primary" : "btn"} onClick={() => saveDb("sqlite")} disabled={Boolean(db?.require_db)}>SQLite (zero setup)</button>{" "}
             <button type="button" className={db?.engine === "postgres" ? "btn primary" : "btn"} onClick={() => saveDb("postgres")}>PostgreSQL (paste URL)</button>{" "}
             <input value={dbUrl} onChange={(e) => setDbUrl(e.target.value)} placeholder="postgresql://user:pass@host:5432/db" aria-label="Database URL"
               style={{ font: "inherit", fontSize: 12, padding: "6px 10px", borderRadius: 3, border: "1px solid var(--line2)", background: "#080b10", color: "inherit", width: "min(320px, 100%)" }} />

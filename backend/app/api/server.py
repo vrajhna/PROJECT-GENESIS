@@ -16,7 +16,8 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
+                               StreamingResponse)
 from pydantic import BaseModel, Field
 
 from ..access import github as gh
@@ -198,6 +199,46 @@ def err(request: Request, message: str, status: int = 400) -> JSONResponse:
                         status_code=status)
 
 
+class StorageUnavailable(Exception):
+    """Website strict mode cannot reach Postgres. Never fall back to files."""
+
+
+@app.exception_handler(StorageUnavailable)
+async def storage_unavailable_handler(request: Request, exc: StorageUnavailable):
+    return JSONResponse({"ok": False,
+                         "error": "database unavailable — website mode refuses file fallback",
+                         "request_id": getattr(request.state, "request_id", "")},
+                        status_code=503)
+
+
+def strict_db() -> bool:
+    """True only for website deployments: Postgres is the system of record."""
+    if not require_db():
+        return False
+    try:
+        from ..db import pg as _pgmod
+        return bool(_pgmod.db_url() and _pgmod.available())
+    except Exception:
+        return False
+
+
+def ensure_store() -> None:
+    """Refuse website work when strict Postgres persistence is unavailable."""
+    if require_db() and not strict_db():
+        raise StorageUnavailable()
+
+
+def _pg_conn():
+    try:
+        from ..db import pg as _pgmod
+    except ImportError as e:
+        raise StorageUnavailable() from e
+    con = _pgmod.connect()
+    if con is None:
+        raise StorageUnavailable()
+    return con
+
+
 PID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -214,6 +255,20 @@ def proj_dir(pid: str) -> Path:
 def load_project(pid: str) -> dict | None:
     if not _safe_pid(pid):
         return None
+    if strict_db():
+        from ..db import pg as _pgmod
+        con = _pg_conn()
+        try:
+            try:
+                doc = _pgmod.project_get(con, pid)
+            except Exception as e:
+                raise StorageUnavailable() from e
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return doc if isinstance(doc, dict) else None
     meta = proj_dir(pid) / "project.json"
     if not meta.exists():
         return None
@@ -221,9 +276,73 @@ def load_project(pid: str) -> dict | None:
 
 
 def save_project(meta: dict) -> None:
-    d = proj_dir(meta["id"])
+    doc = dict(meta or {})
+    doc["updated"] = time.time()
+    meta.update(doc)
+    if strict_db():
+        from ..db import pg as _pgmod
+        if not _safe_pid(doc.get("id") or ""):
+            raise ValueError(f"bad project id: {doc.get('id')!r}")
+        con = _pg_conn()
+        try:
+            try:
+                saved = _pgmod.project_save(con, doc)
+            except Exception as e:
+                raise StorageUnavailable() from e
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        meta.update(saved)
+        return
+    d = proj_dir(doc["id"])
     d.mkdir(parents=True, exist_ok=True)
-    (d / "project.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (d / "project.json").write_text(json.dumps(doc, indent=2), encoding="utf-8")
+
+
+def save_report(pid: str, report: dict) -> None:
+    if strict_db():
+        from ..db import pg as _pgmod
+        con = _pg_conn()
+        try:
+            try:
+                _pgmod.report_save(con, pid, report or {})
+            except Exception as e:
+                raise StorageUnavailable() from e
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return
+    (proj_dir(pid) / "report.json").write_text(
+        json.dumps(report or {}, indent=2), encoding="utf-8")
+
+
+def load_report(pid: str) -> dict | None:
+    if strict_db():
+        from ..db import pg as _pgmod
+        con = _pg_conn()
+        try:
+            try:
+                doc = _pgmod.report_get(con, pid)
+            except Exception as e:
+                raise StorageUnavailable() from e
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return doc if isinstance(doc, dict) else None
+    rep = proj_dir(pid) / "report.json"
+    if not rep.exists():
+        return None
+    try:
+        doc = json.loads(rep.read_text(encoding="utf-8"))
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 class NewProject(BaseModel):
@@ -287,6 +406,7 @@ def _zip_tree(base: Path, rels: list[str], arc_prefix: str) -> bytes:
     import io
     import zipfile
     buf = io.BytesIO()
+    entries = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for rel in rels:
             p = base / rel
@@ -299,9 +419,13 @@ def _zip_tree(base: Path, rels: list[str], arc_prefix: str) -> bytes:
                             and "node_modules" not in f.parts:
                         relpath = f.relative_to(base)
                         z.write(f, f"{arc_prefix}/{relpath}" if arc_prefix else str(relpath))
+                        entries += 1
             else:
                 z.write(p, f"{arc_prefix}/{rel}" if arc_prefix else rel)
-    return buf.getvalue()
+                entries += 1
+    # An empty zip is still 22 bytes — callers test truthiness to detect
+    # missing packs, so empty must mean empty.
+    return buf.getvalue() if entries else b""
 
 
 @app.get("/api/health")
@@ -312,9 +436,16 @@ def health():
             {"ok": False, "service": "genesis", "mode": mode,
              "error": "DATABASE_URL required (GENESIS_REQUIRE_DB=1) — refusing file mode"},
             status_code=503)
+    if require_db() and not strict_db():
+        return JSONResponse(
+            {"ok": False, "service": "genesis", "mode": mode,
+             "error": "DATABASE_URL is not reachable (GENESIS_REQUIRE_DB=1) — refusing file mode"},
+            status_code=503)
     db = "postgres" if mode == "server" else "sqlite/files"
+    store = "postgres" if strict_db() else ("postgres-shared" if mode == "server" else "files")
     return {"ok": True, "service": "genesis", "time": time.time(),
-            "mode": mode, "db": db, "meta": dict(_meta_cache)}
+            "mode": mode, "db": db, "store": store,
+            "require_db": require_db(), "meta": dict(_meta_cache)}
 
 
 @app.post("/api/settings/meta/check")
@@ -387,6 +518,7 @@ def _csrf_ok(request: Request) -> bool:
 
 
 def need_member(request: Request):
+    ensure_store()
     if server_mode() == "local":
         # Laptop / terminal mode: your files, your machine — no login walls.
         # (Server mode always requires a real login; see below.)
@@ -400,6 +532,7 @@ def need_member(request: Request):
 
 
 def need_access(pid: str, request: Request):
+    ensure_store()
     if server_mode() == "local":
         meta = load_project(pid)
         if meta is None:
@@ -517,6 +650,19 @@ def delete_project(pid: str, request: Request):
         idx = _publishes_index()
         idx.pop(slug, None)
         _save_publishes_index(idx)
+    if strict_db():
+        from ..db import pg as _pgmod
+        con = _pg_conn()
+        try:
+            try:
+                _pgmod.project_delete(con, pid)
+            except Exception as e:
+                raise StorageUnavailable() from e
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
     try:
         target = proj_dir(pid)
         base = (DATA_DIR / "projects").resolve()
@@ -553,6 +699,22 @@ def list_projects(request: Request):
     me, error = need_member(request)
     if error is not None:
         return {"ok": True, "projects": []}
+    if strict_db():
+        from ..db import pg as _pgmod
+        con = _pg_conn()
+        try:
+            try:
+                docs = _pgmod.project_list(con)
+            except Exception as e:
+                raise StorageUnavailable() from e
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return {"ok": True, "projects": [
+            m for m in docs
+            if not (m.get("owner_email") or "") or m.get("owner_email") == me["email"]]}
     out = []
     base = DATA_DIR / "projects"
     if base.exists():
@@ -621,7 +783,8 @@ def get_database():
     import os
     url = os.environ.get("DATABASE_URL", "")
     return {"ok": True, "engine": "postgres" if url else "sqlite",
-            "live": "pending — reachable DB required" if url else "verified — zero setup"}
+            "live": "pending — reachable DB required" if url else "verified — zero setup",
+            "require_db": require_db(), "strict": strict_db()}
 
 
 def _pg_reachable(url: str) -> tuple[bool, str]:
@@ -654,6 +817,16 @@ def set_database(body: DbIn, request: Request):
     if body.engine == "postgres":
         if not body.url.startswith(("postgresql://", "postgres://")):
             return err(request, "postgres needs a postgresql:// URL", 400)
+        if require_db():
+            ok, live = _pg_reachable(body.url)
+            if not ok:
+                return err(request, f"website database not verified: {live}", 400)
+            os.environ["DATABASE_URL"] = body.url
+            try:
+                _set_dotenv_var("DATABASE_URL", body.url)
+            except OSError as e:
+                return err(request, f"database live for this session, disk write failed: {e}", 500)
+            return {"ok": True, "engine": "postgres", "live": live}
         os.environ["DATABASE_URL"] = body.url
         try:
             _set_dotenv_var("DATABASE_URL", body.url)
@@ -661,6 +834,8 @@ def set_database(body: DbIn, request: Request):
             return err(request, f"database live for this session, disk write failed: {e}", 500)
         _, live = _pg_reachable(body.url)
         return {"ok": True, "engine": "postgres", "live": live}
+    if require_db():
+        return err(request, "website deployments require postgres — sqlite is laptop-only", 400)
     os.environ.pop("DATABASE_URL", None)
     return {"ok": True, "engine": "sqlite", "live": "verified — zero setup"}
 
@@ -710,6 +885,7 @@ def chat(pid: str, body: ChatIn, request: Request):
              + "; ".join(r["id"] + " " + r["description"][:60] for r in arch.data["requirements"])
              + ". Press Build and I will generate, install, start, test and verify — showing every step.")
     client = MetaClient()
+    model_error = ""
     if client.config.api_key:
         try:
             _, prompt = render("plan.make", {"requirements": json.dumps(arch.data["requirements"])})
@@ -719,10 +895,15 @@ def chat(pid: str, body: ChatIn, request: Request):
                 note = _extract_text(routed.get("data") or {}).strip().replace("\n", " ")[:400]
                 if note:
                     reply += " (Model note: " + note + ")"
-        except Exception:
-            pass
-    return {"ok": True, "mode": "plan", "reply": reply,
-            "requirements": arch.data["requirements"]}
+            else:
+                model_error = str(routed.get("error") or "model call failed")[:300]
+        except Exception as e:
+            model_error = f"{type(e).__name__}: {e}"[:300]
+    out = {"ok": True, "mode": "plan", "reply": reply,
+           "requirements": arch.data["requirements"]}
+    if model_error:
+        out["model_error"] = model_error
+    return out
 
 
 @app.post("/api/projects/{pid}/build")
@@ -734,7 +915,7 @@ def build_project(pid: str, request: Request):
         return err(request, "set a specification first (POST spec)", 400)
     workdir = proj_dir(pid) / "work"
     report = build_and_verify(meta["spec"], workdir)
-    (proj_dir(pid) / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    save_report(pid, report)
     return {"ok": report["verdict"] == "VERIFIED", "report": report}
 
 
@@ -781,8 +962,7 @@ def build_fullstack_app(pid: str, request: Request, body: FullstackIn | None = N
         def _run_fullstack(**kw):
             rep = build_fullstack(meta["spec"], workdir, answers=chosen, **kw)
             try:
-                (proj_dir(pid) / "report.json").write_text(
-                    json.dumps(rep, indent=2), encoding="utf-8")
+                save_report(pid, rep)
             except OSError:
                 pass
             return rep
@@ -790,7 +970,7 @@ def build_fullstack_app(pid: str, request: Request, body: FullstackIn | None = N
         run_id = runstore.start_run(pid, "fullstack", _run_fullstack)
         return {"ok": True, "run_id": run_id}
     report = build_fullstack(meta["spec"], workdir, answers=chosen)
-    (proj_dir(pid) / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    save_report(pid, report)
     return {"ok": report["verdict"] == "VERIFIED", "report": report}
 
 
@@ -838,6 +1018,7 @@ def build_stream(pid: str, request: Request, run_id: str = ""):
                     "error": snap["error"]}) + "\n\n")
                 break
             runstore.wait_done(run_id, timeout=20)
+            time.sleep(1)
     return StreamingResponse(events(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
@@ -850,8 +1031,22 @@ def intelligence_status():
     from ..tools.registry import TOOLS
     agents = sorted(n for n in dir(_roles) if n.endswith("Agent"))
     try:
-        from ..memory.skill_registry import SkillRegistry
-        skill_ids = [s.id for s in SkillRegistry(DATA_DIR / "skills.json").list()]
+        if strict_db():
+            from ..db import pg as _pgmod
+            con = _pg_conn()
+            try:
+                registry = _pgmod.kv_get(con, "skills:registry")
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+            skill_ids = sorted(registry) if isinstance(registry, dict) else []
+        else:
+            from ..memory.skill_registry import SkillRegistry
+            skill_ids = [s.id for s in SkillRegistry(DATA_DIR / "skills.json").list()]
+    except StorageUnavailable:
+        raise
     except Exception:
         skill_ids = []
     return {"ok": True,
@@ -862,6 +1057,26 @@ def intelligence_status():
             "agents": agents,
             "tools": {"count": len(TOOLS), "names": [t.name for t in TOOLS]},
             "skills": {"count": len(skill_ids), "ids": skill_ids}}
+
+
+@app.get("/api/download/install.sh")
+def download_install_sh():
+    p = CLI_DIR / "install.sh"
+    if not p.is_file():
+        return JSONResponse({"ok": False, "error": "installer missing on server"},
+                            status_code=500)
+    return PlainTextResponse(p.read_text(encoding="utf-8"),
+                             headers={"Content-Disposition": "attachment; filename=install.sh"})
+
+
+@app.get("/api/download/install.ps1")
+def download_install_ps1():
+    p = CLI_DIR / "install.ps1"
+    if not p.is_file():
+        return JSONResponse({"ok": False, "error": "installer missing on server"},
+                            status_code=500)
+    return PlainTextResponse(p.read_text(encoding="utf-8"),
+                             headers={"Content-Disposition": "attachment; filename=install.ps1"})
 
 
 @app.get("/api/download/cli")
@@ -887,23 +1102,18 @@ def download_engine():
 def get_report(pid: str, request: Request):
     if load_project(pid) is None:
         return err(request, "unknown project", 404)
-    rep = proj_dir(pid) / "report.json"
-    if not rep.exists():
+    report = load_report(pid)
+    if report is None:
         return err(request, "no build yet", 404)
-    return {"ok": True, "report": json.loads(rep.read_text(encoding="utf-8"))}
+    return {"ok": True, "report": report}
 
 
 @app.get("/api/runs/{pid}/events")
 def run_events(pid: str):
     if load_project(pid) is None:
         return JSONResponse({"ok": False, "error": "unknown project"}, status_code=404)
-    rep = proj_dir(pid) / "report.json"
-    steps = []
-    if rep.exists():
-        try:
-            steps = json.loads(rep.read_text(encoding="utf-8")).get("steps", [])
-        except ValueError:
-            steps = []
+    report = load_report(pid)
+    steps = report.get("steps", []) if isinstance(report, dict) else []
 
     def gen():
         yield f"data: {json.dumps({'type': 'hello', 'project': pid})}\n\n"
@@ -991,6 +1201,20 @@ def _slugify(name: str, pid: str) -> str:
 
 
 def _publishes_index() -> dict:
+    if strict_db():
+        from ..db import pg as _pg
+        con = _pg_conn()
+        try:
+            try:
+                v = _pg.kv_get(con, "publishes:index")
+            except Exception as e:
+                raise StorageUnavailable() from e
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return v if isinstance(v, dict) else {}
     try:
         from ..db import pg as _pg
         con = _pg.connect()
@@ -1013,6 +1237,21 @@ def _publishes_index() -> dict:
 
 
 def _save_publishes_index(idx: dict) -> None:
+    if strict_db():
+        from ..db import pg as _pg
+        con = _pg_conn()
+        try:
+            try:
+                _pg.ensure_schema(con)
+                _pg.kv_set(con, "publishes:index", idx)
+            except Exception as e:
+                raise StorageUnavailable() from e
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        return
     try:
         from ..db import pg as _pg
         con = _pg.connect()
@@ -1231,14 +1470,12 @@ def _project_stats(pid: str) -> dict:
     work = base / "work"
     files = inspect_tree(work) if work.exists() else []
     verdict, passed = "never-built", 0
-    rep = base / "report.json"
-    if rep.exists():
-        try:
-            r = json.loads(rep.read_text(encoding="utf-8"))
-            verdict = r.get("verdict", "unknown")
-            passed = sum(1 for s in r.get("steps", []) if s.get("ok"))
-        except ValueError:
-            verdict = "corrupt-report"
+    r = load_report(pid)
+    if isinstance(r, dict):
+        verdict = r.get("verdict", "unknown")
+        passed = sum(1 for s in r.get("steps", []) if s.get("ok"))
+    elif not strict_db() and (base / "report.json").exists():
+        verdict = "corrupt-report"
     return {"files": len(files), "verdict": verdict, "steps_ok": passed}
 
 
@@ -1255,11 +1492,12 @@ def dashboard(request: Request):
         if st["verdict"] == "VERIFIED":
             verified += 1
             total_passed += st["steps_ok"]
-        mtime = 0
-        try:
-            mtime = (proj_dir(p["id"]) / "project.json").stat().st_mtime
-        except OSError:
-            pass
+        mtime = p.get("updated") or p.get("created") or 0
+        if not mtime and not strict_db():
+            try:
+                mtime = (proj_dir(p["id"]) / "project.json").stat().st_mtime
+            except OSError:
+                pass
         items.append({**p, **st, "mtime": mtime})
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return {"ok": True,
@@ -1332,12 +1570,23 @@ def _auto_runnable(argv: list[str]) -> bool:
     return True
 
 
+_TERMINAL_ENV_ALLOW = {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "TZ",
+                         "PYTHONDONTWRITEBYTECODE", "PYTHONHASHSEED",
+                         "NODE_PATH", "NPM_CONFIG_CACHE"}
+
+
 def _exec_terminal(pid: str, argv: list[str]) -> dict:
+    import os
     import subprocess
     (proj_dir(pid) / "work").mkdir(parents=True, exist_ok=True)
+    # Allowlist env: terminal children must never see server secrets
+    # (MODEL_API_KEY, DATABASE_URL, tokens) even if a command prints environ.
+    env = {k: v for k, v in os.environ.items() if k in _TERMINAL_ENV_ALLOW}
+    env.setdefault("PATH", "/usr/bin:/bin")
     try:
         proc = subprocess.run(argv, cwd=str(proj_dir(pid) / "work"),
-                              capture_output=True, text=True, timeout=30, shell=False)
+                              capture_output=True, text=True, timeout=30,
+                              shell=False, env=env)
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "30s time limit exceeded"}
     except FileNotFoundError as e:
@@ -1360,6 +1609,11 @@ def terminal_request(pid: str, body: TermIn, request: Request):
     _, meta, error = need_access(pid, request)
     if error is not None:
         return error
+    if server_mode() != "local":
+        return err(request, "terminal execution runs on laptop/CLI mode only — "
+                            "on the website, code runs inside verified Docker "
+                            "builds (sandboxed terminal is tracked future work)",
+                   403)
     if not all(isinstance(a, str) for a in body.argv) or len(" ".join(body.argv)) > 2000:
         return err(request, "argv must be a list of short strings (no shell)", 400)
     if (meta.get("policy") or {}).get("autopilot") and _auto_runnable(body.argv):
@@ -1388,6 +1642,9 @@ def terminal_approve(pid: str, body: TermApprove, request: Request):
     _, _, error = need_access(pid, request)
     if error is not None:
         return error
+    if server_mode() != "local":
+        return err(request, "terminal execution runs on laptop/CLI mode only",
+                   403)
     gate = _gates.setdefault(pid, ApprovalGate())
     if not body.approved:
         try:

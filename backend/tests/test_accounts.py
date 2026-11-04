@@ -66,6 +66,16 @@ def test_full_login_lifecycle(client):
                  headers={"Authorization": f"Bearer {token}"}).status_code == 401
 
 
+def test_otp_is_secrets_backed():
+    import inspect
+    from app.auth import accounts as acc
+    codes = {acc._new_otp() for _ in range(20)}
+    assert len(codes) > 1
+    assert all(re.fullmatch(r"\d{6}", c) for c in codes)
+    src = inspect.getsource(acc._new_otp)
+    assert "secrets" in src and "random" not in src
+
+
 def test_wrong_code_and_try_limits(client):
     c, codes, _ = client
     c.post("/api/auth/request", json={"email": "w@x.co"})

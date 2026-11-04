@@ -68,3 +68,38 @@ def test_engine_zip_never_contains_dotenv(tmp_path):
     blob = _client(tmp_path).get("/api/download/engine").content
     names = zipfile.ZipFile(io.BytesIO(blob)).namelist()
     assert not any(n.endswith("/.env") or n == ".env" for n in names)
+
+
+def test_terminal_refused_in_server_mode(tmp_path, monkeypatch):
+    from app.auth import accounts as acc
+    c = _client(tmp_path)
+    monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@127.0.0.1:1/x")
+    codes = {}
+    monkeypatch.setattr(acc, "send_otp_mail",
+                        lambda to, code, mailer=None: codes.__setitem__(to, code))
+    c.post("/api/auth/request", json={"email": "t@x.co"})
+    token = c.post("/api/auth/verify",
+                   json={"email": "t@x.co", "code": codes["t@x.co"],
+                         "name": "T"}).json()["token"]
+    h = {"Authorization": "Bearer " + token}
+    pid = c.post("/api/projects", json={"name": "A"}, headers=h).json()["project"]["id"]
+    r = c.post(f"/api/projects/{pid}/terminal", json={"argv": ["echo", "hi"]},
+               headers=h)
+    assert r.status_code == 403 and "laptop" in r.json()["error"]
+    r = c.post(f"/api/projects/{pid}/terminal/approve",
+               json={"approval_id": "x", "approved": True}, headers=h)
+    assert r.status_code == 403
+
+
+def test_terminal_children_never_see_server_secrets(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setenv("MODEL_API_KEY", "LLM_probe_secret")
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    srv.DATA_DIR = tmp_path / "data"
+    out = srv._exec_terminal(
+        "probe-proj",
+        [sys.executable, "-c",
+         "import os;print('LEAK' if 'MODEL_API_KEY' in os.environ else 'clean')"])
+    assert out["ok"] is True and out["output"].strip() == "clean"

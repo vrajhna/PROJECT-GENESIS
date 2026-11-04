@@ -2,6 +2,8 @@
 
 Storage: Postgres tables (genesis_users, genesis_otps, genesis_sessions)
 when DATABASE_URL is live, else JSON files under GENESIS_DATA_DIR/accounts.
+Website deployments set GENESIS_REQUIRE_DB=1: Postgres only, no file
+fallback, and storage failures answer 503 honestly.
 OTPs are sha256-hashed, 6 digits, 10-minute expiry, 5 tries then dead.
 Request rate: 5 codes per 10 minutes per email. Sessions: 30-day bearer
 tokens. Mail goes through smtplib (stdlib); without SMTP_* env the request
@@ -86,12 +88,22 @@ def _pg():
     return con
 
 
+def _strict_db() -> bool:
+    if os.environ.get("GENESIS_REQUIRE_DB") != "1":
+        return False
+    try:
+        from ..db import pg as _p
+    except ImportError:
+        return False
+    return bool(_p.db_url())
+
+
 def _otp_hash(code: str) -> str:
     return hashlib.sha256(code.encode()).hexdigest()
 
 
 def _new_otp() -> str:
-    return str(__import__("random").randint(100000, 999999))
+    return str(secrets.randbelow(900000) + 100000)
 
 
 # ---------- mail (stdlib smtplib equivalent: dynamic import, tested via fake)
@@ -176,7 +188,10 @@ def _file_del(table: str, key: str) -> bool:
 
 
 def _store_otp(email: str, rec: dict) -> None:
+    strict = _strict_db()
     con = _pg()
+    if strict and con is None:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if con is not None:
         try:
             from ..db import pg as _p
@@ -197,13 +212,19 @@ def _store_otp(email: str, rec: dict) -> None:
                 cur.close()
                 con.close()
         except Exception:
-            pass
+            if strict:
+                raise AuthFail(503, "database unavailable — website mode refuses file fallback")
+    if strict:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if not _file_put("otps", email, rec):
         raise AuthFail(500, "storage unavailable")
 
 
 def _load_otp(email: str):
+    strict = _strict_db()
     con = _pg()
+    if strict and con is None:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if con is not None:
         try:
             cur = con.cursor()
@@ -218,13 +239,21 @@ def _load_otp(email: str):
                 return {"hash": r[0], "exp": r[1], "tries": r[2],
                         "count": r[3], "window_start": r[4]}
             return None
+        except AuthFail:
+            raise
         except Exception:
-            pass
+            if strict:
+                raise AuthFail(503, "database unavailable — website mode refuses file fallback")
+    if strict:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     return _file_get("otps", email)
 
 
 def _clear_otp(email: str) -> None:
+    strict = _strict_db()
     con = _pg()
+    if strict and con is None:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if con is not None:
         try:
             cur = con.cursor()
@@ -235,12 +264,18 @@ def _clear_otp(email: str) -> None:
                 cur.close()
                 con.close()
         except Exception:
-            pass
+            if strict:
+                raise AuthFail(503, "database unavailable — website mode refuses file fallback")
+    if strict:
+        return
     _file_del("otps", email)
 
 
 def _get_user(email: str):
+    strict = _strict_db()
     con = _pg()
+    if strict and con is None:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if con is not None:
         try:
             cur = con.cursor()
@@ -255,13 +290,21 @@ def _get_user(email: str):
                 return {"email": r[0], "name": r[1],
                         "createdAt": r[2], "lastLogin": r[3]}
             return None
+        except AuthFail:
+            raise
         except Exception:
-            pass
+            if strict:
+                raise AuthFail(503, "database unavailable — website mode refuses file fallback")
+    if strict:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     return _file_get("users", email)
 
 
 def _save_user(member: dict) -> None:
+    strict = _strict_db()
     con = _pg()
+    if strict and con is None:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if con is not None:
         try:
             from ..db import pg as _p
@@ -281,13 +324,19 @@ def _save_user(member: dict) -> None:
                 cur.close()
                 con.close()
         except Exception:
-            pass
+            if strict:
+                raise AuthFail(503, "database unavailable — website mode refuses file fallback")
+    if strict:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if not _file_put("users", member["email"], member):
         raise AuthFail(500, "storage unavailable")
 
 
 def _save_session(token: str, email: str, exp: int) -> None:
+    strict = _strict_db()
     con = _pg()
+    if strict and con is None:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if con is not None:
         try:
             cur = con.cursor()
@@ -301,13 +350,19 @@ def _save_session(token: str, email: str, exp: int) -> None:
                 cur.close()
                 con.close()
         except Exception:
-            pass
+            if strict:
+                raise AuthFail(503, "database unavailable — website mode refuses file fallback")
+    if strict:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if not _file_put("sessions", token, {"email": email, "exp": exp}):
         raise AuthFail(500, "storage unavailable")
 
 
 def _load_session(token: str):
+    strict = _strict_db()
     con = _pg()
+    if strict and con is None:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if con is not None:
         try:
             cur = con.cursor()
@@ -321,13 +376,21 @@ def _load_session(token: str):
             if r:
                 return {"email": r[0], "exp": r[1]}
             return None
+        except AuthFail:
+            raise
         except Exception:
-            pass
+            if strict:
+                raise AuthFail(503, "database unavailable — website mode refuses file fallback")
+    if strict:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     return _file_get("sessions", token)
 
 
 def _del_session(token: str) -> None:
+    strict = _strict_db()
     con = _pg()
+    if strict and con is None:
+        raise AuthFail(503, "database unavailable — website mode refuses file fallback")
     if con is not None:
         try:
             cur = con.cursor()
@@ -338,7 +401,10 @@ def _del_session(token: str) -> None:
                 cur.close()
                 con.close()
         except Exception:
-            pass
+            if strict:
+                raise AuthFail(503, "database unavailable — website mode refuses file fallback")
+    if strict:
+        return
     _file_del("sessions", token)
 
 

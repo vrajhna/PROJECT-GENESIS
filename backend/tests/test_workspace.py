@@ -65,6 +65,7 @@ def test_playground_runs_and_saves(tmp_path, monkeypatch):
 def test_terminal_approval_keeps_spaced_argv(tmp_path, monkeypatch):
     c = _client(tmp_path)
     h = _login(c, tmp_path, monkeypatch)
+    monkeypatch.delenv("DATABASE_URL", raising=False)  # laptop mode: terminal runs only locally
     pid = c.post("/api/projects", json={"name": "T"}, headers=h).json()["project"]["id"]
     c.post(f"/api/projects/{pid}/policy", json={"autopilot": False}, headers=h)
     req = c.post(f"/api/projects/{pid}/terminal",
@@ -77,6 +78,7 @@ def test_terminal_approval_keeps_spaced_argv(tmp_path, monkeypatch):
 def test_terminal_approval_flow(tmp_path, monkeypatch):
     c = _client(tmp_path)
     h = _login(c, tmp_path, monkeypatch)
+    monkeypatch.delenv("DATABASE_URL", raising=False)  # laptop mode: terminal runs only locally
     pid = c.post("/api/projects", json={"name": "T"}, headers=h).json()["project"]["id"]
     c.post(f"/api/projects/{pid}/policy", json={"autopilot": False}, headers=h)
     req = c.post(f"/api/projects/{pid}/terminal", json={"argv": ["echo", "hi"]}, headers=h).json()

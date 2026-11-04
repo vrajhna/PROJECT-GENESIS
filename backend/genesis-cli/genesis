@@ -9,8 +9,11 @@ Stdlib only: needs nothing but Python 3.8+. Talks to a Genesis server
     genesis build <id> [--db sqlite|postgres] [--cache none|redis] [--payments none|stripe-test|razorpay-test]
     genesis download <id> [out.zip]
     genesis chat <id> "add a contact page"
+    genesis talk <id>     # interactive chat loop, like talking to Muse
     genesis status        # engine + models backing this terminal
     genesis serve         # start a local server (needs the engine pack)
+    genesis login         # hosted server: email + OTP, token kept locally
+    genesis logout        # forget the saved token
 """
 
 import argparse
@@ -22,12 +25,41 @@ import urllib.error
 import urllib.request
 
 BASE = os.environ.get("GENESIS_URL", "http://127.0.0.1:8000")
+TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".genesis", "token")
+
+
+def _token():
+    tok = os.environ.get("GENESIS_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        with open(TOKEN_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _save_token(tok):
+    os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+        f.write(tok.strip() + "\n")
+    try:
+        os.chmod(TOKEN_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _auth_headers():
+    tok = _token()
+    return {"Authorization": "Bearer " + tok} if tok else {}
 
 
 def _req(method, path, body=None, timeout=900):
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    headers.update(_auth_headers())
     req = urllib.request.Request(BASE + path, data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read().decode() or "{}"
@@ -92,7 +124,8 @@ def cmd_build(args):
 
 
 def cmd_download(args):
-    req = urllib.request.Request(f"{BASE}/api/projects/{args.id}/download")
+    req = urllib.request.Request(f"{BASE}/api/projects/{args.id}/download",
+                                 headers=_auth_headers())
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             blob = r.read()
@@ -162,7 +195,8 @@ def cmd_auto(args):
         print(f"stopped: {rep.get('reason', '')}")
         return 1
     out = args.out or f"genesis-{pid}.zip"
-    req = urllib.request.Request(f"{BASE}/api/projects/{pid}/download")
+    req = urllib.request.Request(f"{BASE}/api/projects/{pid}/download",
+                                 headers=_auth_headers())
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             blob = r.read()
@@ -185,8 +219,10 @@ def cmd_upload(args):
         return _fail(proj, status)
     pid = proj["project"]["id"]
     body, boundary = _multipart(args.zip)
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    headers.update(_auth_headers())
     req = urllib.request.Request(f"{BASE}/api/projects/{pid}/upload", data=body, method="POST",
-                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             up = json.loads(r.read().decode() or "{}")
@@ -208,6 +244,66 @@ def cmd_policy(args):
     if not data.get("ok"):
         return _fail(data, status)
     print(f"autopilot: {'on' if data['policy']['autopilot'] else 'off'}")
+    return 0
+
+
+def cmd_login(args):
+    email = args.email or input("email: ").strip()
+    if not email:
+        print("error: an email is required")
+        return 1
+    status, data = _req("POST", "/api/auth/request", {"email": email},
+                        timeout=60)
+    if not data.get("ok"):
+        return _fail(data, status)
+    print(f"code sent to {email} — check your inbox.")
+    code = input("code: ").strip()
+    name = args.name or ""
+    status, data = _req("POST", "/api/auth/verify",
+                        {"email": email, "code": code, "name": name},
+                        timeout=60)
+    if data.get("needProfile") and not name:
+        name = input("display name (first login): ").strip()
+        status, data = _req("POST", "/api/auth/verify",
+                            {"email": email, "code": code, "name": name},
+                            timeout=60)
+    if not data.get("ok"):
+        return _fail(data, status)
+    _save_token(data["token"])
+    member = data.get("member", {}) or {}
+    print(f"logged in as {member.get('email', email)}. token kept in ~/.genesis/token.")
+    return 0
+
+
+def cmd_logout(args):
+    try:
+        os.remove(TOKEN_FILE)
+        print("logged out — token deleted.")
+    except OSError:
+        print("no saved token.")
+    return 0
+
+
+def cmd_talk(args):
+    print(f"talking to genesis about {args.id} — /quit to leave.")
+    while True:
+        try:
+            msg = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if msg in ("/quit", "/exit"):
+            return 0
+        if not msg:
+            continue
+        status, data = _req("POST", f"/api/projects/{args.id}/chat",
+                            {"message": msg})
+        if not data.get("ok", False) and "reply" not in data:
+            print(f"error [{status}]: {data.get('error', 'unknown')}")
+            continue
+        print(f"genesis> {data.get('reply', '')}")
+        if data.get("model_error"):
+            print(f"(model unavailable: {data['model_error']})")
     return 0
 
 
@@ -271,6 +367,15 @@ def main(argv=None):
     s.set_defaults(fn=cmd_policy)
     s = sub.add_parser("serve", help="start a local engine server")
     s.set_defaults(fn=cmd_serve)
+    s = sub.add_parser("login", help="log in to a hosted server (email + OTP)")
+    s.add_argument("email", nargs="?", default="")
+    s.add_argument("--name", default="", help="display name for first login")
+    s.set_defaults(fn=cmd_login)
+    s = sub.add_parser("logout", help="forget the saved token")
+    s.set_defaults(fn=cmd_logout)
+    s = sub.add_parser("talk", help="interactive chat about a project")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_talk)
     args = p.parse_args(argv)
     return args.fn(args)
 

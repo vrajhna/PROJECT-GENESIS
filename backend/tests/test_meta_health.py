@@ -150,3 +150,90 @@ def test_require_db_gate(tmp_path, monkeypatch):
     r = c.get("/api/health")
     assert r.status_code == 503
     assert "DATABASE_URL" in r.json()["error"]
+
+
+def _respond_cfg():
+    from app.intelligence.meta_client import MetaConfig
+    return MetaConfig(api_key="LLM_x", base_url="https://api.meta.ai/v1",
+                      primary_model="muse-spark-1.3",
+                      advanced_model="muse-wonder-1.0")
+
+
+def test_respond_retries_timeout_then_succeeds(monkeypatch):
+    import json
+    from app.intelligence.meta_client import MetaClient
+    calls = []
+
+    def flaky(req, timeout=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("read timed out")
+        return FakeResp(json.dumps({"usage": {"total_tokens": 3},
+                                    "output": [{"content": [{"text": "hi"}]}]}).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", flaky)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    out = MetaClient(_respond_cfg()).respond("muse-spark-1.3", "hi")
+    assert out["ok"] is True and len(calls) == 2
+
+
+def test_respond_gives_up_after_max_retries(monkeypatch):
+    from app.intelligence.meta_client import MetaClient
+    calls = []
+
+    def down(req, timeout=None):
+        calls.append(1)
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", down)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    cfg = _respond_cfg()
+    out = MetaClient(cfg).respond("muse-spark-1.3", "hi")
+    assert out["ok"] is False and "TimeoutError" in out["error"]
+    assert len(calls) == 1 + cfg.max_retries
+
+
+class FakeStream(FakeResp):
+    def __init__(self, lines: list[bytes]):
+        super().__init__(b"")
+        self._lines = lines
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def test_respond_stream_assembles_deltas_and_reports_progress(monkeypatch):
+    import json
+    from app.builder.codegen import extract_text
+    from app.intelligence.meta_client import MetaClient
+
+    def sse(payload: str):
+        return b"data: " + payload.encode() + b"\n"
+
+    stream = FakeStream([
+        sse(json.dumps({"type": "response.output_text.delta", "delta": "hel"})),
+        b"\n",
+        sse(json.dumps({"type": "response.output_text.delta", "delta": "lo"})),
+        sse(json.dumps({"type": "response.output_text.done", "text": "hello"})),
+        sse(json.dumps({"type": "response.completed",
+                        "response": {"output_text": "hello"}})),
+        b"data: [DONE]\n",
+    ])
+    seen = []
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: stream)
+    out = MetaClient(_respond_cfg()).respond_stream(
+        "muse-spark-1.3", "hi", on_progress=lambda c, e: seen.append((c, e)))
+    assert out["ok"] is True and out.get("streamed") is True
+    assert extract_text(out["data"]) == "hello"
+    assert [c for c, _ in seen] == [3, 5]
+
+
+def test_respond_stream_without_key_never_streams(monkeypatch):
+    from app.intelligence.meta_client import MetaClient, MetaConfig
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("network!")))
+    cfg = MetaConfig(api_key="", base_url="https://api.meta.ai/v1",
+                     primary_model="muse-spark-1.3",
+                     advanced_model="muse-wonder-1.0")
+    out = MetaClient(cfg).respond_stream("muse-spark-1.3", "hi")
+    assert out["ok"] is False and "MODEL_API_KEY" in out["error"]

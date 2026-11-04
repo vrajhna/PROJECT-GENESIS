@@ -128,6 +128,22 @@ def test_push_needs_approval_and_token(tmp_path: Path):
     assert refused2["ok"] is False and "GITHUB_TOKEN" in refused2["error"]
 
 
+def test_git_ref_names_cannot_be_flags_or_ranges(tmp_path: Path):
+    assert gh._ref_ok("main") is True
+    assert gh._ref_ok("genesis/change-1") is True
+    assert gh._ref_ok("HEAD") is True
+    for evil in ("--upload-pack=x", "-b", "a..b", "..", "HEAD~1",
+                 "@{u}", "x y", "", "a" * 101):
+        assert gh._ref_ok(evil) is False, evil
+    work = tmp_path / "w"
+    bad_clone = gh.clone(f"file://{tmp_path}/origin", work,
+                         branch="--upload-pack=x")
+    assert bad_clone["ok"] is False and "branch" in bad_clone["error"]
+    assert not work.exists()  # rejected before touching disk
+    assert gh.diff_summary(work, base="--output=/tmp/pwn")["ok"] is False
+    assert gh.push(work, "--all", approved=True)["ok"] is False
+
+
 def test_connect_and_parse_are_honest():
     st = gh.connect_account()
     assert set(st) >= {"ok"}

@@ -7,7 +7,9 @@ Templates in fullstack.py are the offline/no-key fallback, never the story.
 Contract enforced here before a single byte is written:
   - exact file set, paths confined to the project workdir (no .., no /abs)
   - per-file + total size caps
-  - no secret patterns, localhost bind present in backend/server.py
+  - no secret patterns, GENESIS_BIND honored with a localhost default in
+    backend/server.py (a hardcoded loopback bind is deterministically
+    adapted; any world bind is rejected)
   - JSON-only model output, parsed defensively
 Any violation -> caller falls back to templates. Never raises for
 model-side problems; raises only for programmer errors (bad test fakes).
@@ -45,6 +47,47 @@ SECRET_PATTERNS = (
     re.compile(r"BEGIN .*PRIVATE KEY"),
     re.compile(r"rzp_(live|test)_[A-Za-z0-9]+"),
 )
+
+
+def ensure_sandbox_bind(files: dict) -> tuple[dict, bool]:
+    """Deterministic bind adapter for model-written servers.
+
+    A hardcoded 127.0.0.1 bind is unreachable inside the Docker sandbox
+    (proven live with Wonder output): the container must listen on all
+    interfaces while Docker publishes only to host loopback. When the
+    model ignored the GENESIS_BIND contract, rewrite the bind tuple to
+    honor GENESIS_BIND with a 127.0.0.1 default — loopback behavior is
+    unchanged everywhere the variable is unset. Returns (files, adapted).
+    Anything already world-bound is left untouched for the validator to
+    reject; this adapter never widens a bind, it only parameterizes a
+    loopback one.
+    """
+    server = files.get("backend/server.py")
+    if not isinstance(server, str) or "GENESIS_BIND" in server:
+        return files, False
+    if '"0.0.0.0"' in server or "'0.0.0.0'" in server:
+        return files, False
+    needle = None
+    for quote in ('"', "'"):
+        for pre in ("", " "):
+            for post in ("", " "):
+                cand = "(" + pre + quote + "127.0.0.1" + quote + post + ","
+                if cand in server:
+                    needle = (cand, "(" + pre + "os.environ.get(" + quote
+                              + "GENESIS_BIND" + quote + ", " + quote
+                              + "127.0.0.1" + quote + ")" + post + ",")
+                    break
+            if needle is not None:
+                break
+        if needle is not None:
+            break
+    if needle is None:
+        return files, False
+    if not any(line.startswith("import os") for line in server.splitlines()):
+        server = "import os\n" + server
+    out = dict(files)
+    out["backend/server.py"] = server.replace(needle[0], needle[1], 1)
+    return out, True
 
 
 def extract_text(data: dict) -> str:
@@ -126,8 +169,12 @@ def validate_files(files: dict) -> tuple[bool, str]:
     if missing:
         return False, f"missing required files: {', '.join(missing)}"
     server = files.get("backend/server.py", "")
-    if "127.0.0.1" not in server:
-        return False, "backend must bind localhost only"
+    if ('"0.0.0.0"' in server or "'0.0.0.0'" in server
+            or 'GENESIS_BIND", "0.0.0.0"' in server):
+        return False, "backend must bind localhost only (world bind forbidden)"
+    if "GENESIS_BIND" not in server or "127.0.0.1" not in server:
+        return False, ("backend must honor GENESIS_BIND with a localhost "
+                       "(127.0.0.1) default")
     return True, "ok"
 
 
@@ -138,11 +185,14 @@ def _is_model_missing(error: str) -> bool:
     return "model_not_found" in e or "model not found" in e or "http 404" in e
 
 
-def generate_with_model(spec: str, requirements: list, resources: list,
-                        auth_on: bool, game_style: str,
-                        client=None, router=None) -> dict:
-    """Ask the model to write the app. Returns a result dict, never raises
-    for model-side problems (callers fall back to templates on ok=False)."""
+def generate_with_model(spec: str, requirements: list,
+                        client=None, router=None, on_progress=None) -> dict:
+    """Ask the model to write the app. The model designs everything from
+    the spec + requirements — no keyword steering reaches it. Returns a
+    result dict, never raises for model-side problems (callers fall back
+    to templates on ok=False). When on_progress is given (and no test
+    router is injected), generation streams and on_progress(chars,
+    elapsed_s) fires as tokens arrive — throttled by the caller."""
     try:
         from ..intelligence.meta_client import MetaClient, MetaConfig
         from ..intelligence.model_router import ModelRouter
@@ -158,12 +208,14 @@ def generate_with_model(spec: str, requirements: list, resources: list,
                 cfg = MetaConfig.from_env()
                 # Full-app generation is long output; give the model room even
                 # when the env default is tuned for quick chat calls.
-                if cfg.timeout_s < 120:
-                    cfg.timeout_s = 120
+                if cfg.timeout_s < 300:
+                    cfg.timeout_s = 300
                 client = MetaClient(cfg)
         if not client.config.api_key:
             return {"ok": False, "error": "MODEL_API_KEY is not set",
                     "fallback": True}
+        use_stream = (on_progress is not None and router is None
+                      and hasattr(client, "respond_stream"))
         router = router or ModelRouter(client)
         # "multi-file" routes to the ADVANCED model by design (see
         # ModelRouter.COMPLEX_HINTS): code generation always gets Wonder,
@@ -175,15 +227,28 @@ def generate_with_model(spec: str, requirements: list, resources: list,
         _, prompt = render("codegen.fullstack", {
             "spec": spec,
             "requirements": req_lines,
-            "resources": ", ".join(resources) if resources else "(none)",
-            "auth": "on" if auth_on else "off",
-            "game": game_style or "none",
         })
         tried: list = []
-        routed = router.run("multi-file codegen", prompt)
+        if use_stream:
+            model = router.pick_model("multi-file codegen")
+            routed = client.respond_stream(model, prompt,
+                                           task="multi-file codegen",
+                                           on_progress=on_progress)
+            routed["model"] = model
+            routed["task_kind"] = "multi-file codegen"
+        else:
+            routed = router.run("multi-file codegen", prompt)
         tried.append(str(routed.get("model") or "?"))
         if not routed.get("ok") and _is_model_missing(str(routed.get("error") or "")):
-            fallback_res = router.run("routine codegen", prompt)
+            if use_stream:
+                model = router.pick_model("routine codegen")
+                fallback_res = client.respond_stream(
+                    model, prompt, task="routine codegen",
+                    on_progress=on_progress)
+                fallback_res["model"] = model
+                fallback_res["task_kind"] = "routine codegen"
+            else:
+                fallback_res = router.run("routine codegen", prompt)
             tried.append(str(fallback_res.get("model") or "?"))
             routed = fallback_res
         if not routed.get("ok"):
@@ -197,14 +262,18 @@ def generate_with_model(spec: str, requirements: list, resources: list,
             return {"ok": False, "error": "empty model reply",
                     "fallback": True}
         files = parse_files(text)
+        files, normalized = ensure_sandbox_bind(files)
         ok, reason = validate_files(files)
         if not ok:
             return {"ok": False, "error": f"contract rejected: {reason}",
                     "fallback": True}
         model = str(routed.get("model") or "model")
         latency = int(routed.get("latency_ms") or 0)
-        return {"ok": True, "files": files, "model": model,
-                "latency_ms": latency}
+        result = {"ok": True, "files": files, "model": model,
+                  "latency_ms": latency}
+        if normalized:
+            result["normalized_bind"] = True
+        return result
     except (ValueError, KeyError) as e:
         return {"ok": False, "error": f"bad model output: {e}",
                 "fallback": True}

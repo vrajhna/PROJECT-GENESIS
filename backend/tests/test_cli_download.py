@@ -80,3 +80,45 @@ def test_cli_help_and_offline_error_are_clean(tmp_path):
     r = subprocess.run([sys.executable, str(CLI), "status"],
                        capture_output=True, text=True, timeout=30, env=env)
     assert r.returncode == 1 and "cannot reach" in r.stdout
+
+
+def test_installers_download(tmp_path):
+    c = _client(tmp_path)
+    sh = c.get("/api/download/install.sh")
+    assert sh.status_code == 200 and "genesis cli" in sh.text.lower()
+    ps1 = c.get("/api/download/install.ps1")
+    assert ps1.status_code == 200 and ".genesis" in ps1.text
+
+
+def test_empty_zip_means_missing(tmp_path):
+    from app.api import server as srv
+    assert srv._zip_tree(tmp_path, ["nope-missing"], "") == b""
+
+
+def test_cli_login_offline_and_talk_quit(tmp_path):
+    import os
+    env = dict(os.environ, GENESIS_URL="http://127.0.0.1:9")
+    r = subprocess.run([sys.executable, str(CLI), "login", "a@b.co"],
+                       capture_output=True, text=True, timeout=30, env=env)
+    assert r.returncode == 1 and "cannot reach" in r.stdout
+    r = subprocess.run([sys.executable, str(CLI), "talk", "proj-x"],
+                       input="/quit\n", capture_output=True, text=True,
+                       timeout=30, env=env)
+    assert r.returncode == 0 and "talking to genesis" in r.stdout
+
+
+def test_cli_token_header_and_save(tmp_path, monkeypatch):
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    loader = SourceFileLoader("genesiscli", str(CLI))
+    spec = importlib.util.spec_from_file_location("genesiscli", str(CLI), loader=loader)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "TOKEN_FILE", str(tmp_path / "token"))
+    monkeypatch.delenv("GENESIS_TOKEN", raising=False)
+    assert mod._auth_headers() == {}
+    mod._save_token("tok-123")
+    assert mod._auth_headers() == {"Authorization": "Bearer tok-123"}
+    monkeypatch.setenv("GENESIS_TOKEN", "tok-env")
+    assert mod._auth_headers() == {"Authorization": "Bearer tok-env"}
