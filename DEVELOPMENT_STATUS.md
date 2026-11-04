@@ -545,6 +545,38 @@
   run_id → poll → VERIFIED with review/live/secure lanes + report.json.
   Full suite: `117 passed` (2 live tests deselected — need a valid key).
 
+## 2026-11-04 — Meta connectivity: diagnosed per official docs, hardened
+
+- Verified our client against the official spec (Models + Authentication
+  + Quickstart pages): base `https://api.meta.ai/v1`, Bearer auth,
+  `GET /v1/models`, `POST /v1/responses` with `{model, input}`,
+  output_text extraction, key format `LLM_<id>_<secret>` — ALL match.
+  The failures are therefore credential-side, not code-side:
+  local key → HTTP 401 invalid_api_key (dead); Railway key → 404
+  model_not_found on `muse-wonder-1.0` (that key lacks Wonder or the ID
+  differs). Docs also confirm: Muse Wonder Full is Muse-Code-only,
+  NEVER on the Model API — there is no Full ID to configure.
+- New `app/intelligence/meta_health.py`: `check_models()` (bounded,
+  exception-proof, never leaks the key) + `meta_health()` returning one
+  of no_key / invalid_key / unreachable / models_missing / ok, with the
+  configured IDs checked against the live catalog.
+- Server: startup background check (only when a key exists; never blocks
+  boot, never breaks tests), `meta` block in `/api/health`,
+  `POST /api/settings/meta/check` for on-demand re-check.
+  `GENESIS_REQUIRE_DB=1` support on health: 503 with a clear message
+  instead of silently running file-backed.
+- Builds never silently fall back: a failed model attempt now writes
+  `report["model_error"]` + a `MODEL GENERATION FAILED: …` decision
+  naming every tried model; the studio notice says so out loud.
+  No-key template builds are labeled `author: offline template (reason)`.
+- Fix: chat no longer claims a model note it never read — attaches the
+  real extracted model text or nothing.
+- Verified: 8 new meta-health tests + full-suite model-authored build
+  (`author: model muse-wonder-1.0`, VERIFIED, no model_error).
+  Full suite: `136 passed` (2 live deselected). Typecheck + build clean.
+  Still needs a human: run the one-line models check on a live key and
+  paste back ONLY the model names — decides exact IDs to configure.
+
 ## 2026-11-04 — Repair in place: chain traced, loop proven on a real app
 
 - STEP 1 diagnosis (frontend chat → API → model → orchestrator → agents →

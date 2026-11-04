@@ -18,8 +18,16 @@ function api(path: string, init: RequestInit = {}) {
   return fetch(`${API}${path}`, { ...init, headers, credentials: "include" });
 }
 
-const AGENTS = [
-  { lane: "architect", label: "Architect", desc: "spec → requirements" },
+/* Build notice: VERIFIED stays VERIFIED, but a failed model attempt is
+   always said out loud — never a silent template build. */
+function noticeFor(report: any, canPublish?: boolean): string {
+  const tail = canPublish ? "publish it" : "run it locally";
+  if (report.verdict !== "VERIFIED") return `Not verified: ${report.reason}`;
+  if (report.model_error) return `Verified — BUT model generation failed (${report.model_error}). Template output below is real and tested, not AI-written. Fix the key/model and rebuild for a model-authored app.`;
+  return `Verified. Preview, download, or ${tail}.`;
+}
+
+const AGENTS = [  { lane: "architect", label: "Architect", desc: "spec → requirements" },
   { lane: "planner", label: "Planner", desc: "stack choices" },
   { lane: "builder", label: "Builder", desc: "model writes the code" },
   { lane: "live", label: "Runner", desc: "install → start → test" },
@@ -347,7 +355,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       const j = await r.json();
       setReport(j.report);
       refreshTree();
-      setNotice(j.report.verdict === "VERIFIED" ? "Verified. Preview, download, or run it locally." : `Not verified: ${j.report.reason}`);
+      setNotice(noticeFor(j.report));
     } catch {
       setNotice("Build request failed — is the backend still running?");
     }
@@ -401,7 +409,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
           if (d.status === "done" && d.report) {
             setReport(d.report);
             setRunStatus("done");
-            setNotice(d.report.verdict === "VERIFIED" ? "Verified. Preview, download, or publish it." : `Not verified: ${d.report.reason}`);
+            setNotice(noticeFor(d.report, true));
           } else {
             setRunStatus("failed");
             setNotice("Build failed: " + (d.error || "see server log"));

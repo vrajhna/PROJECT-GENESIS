@@ -984,8 +984,12 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
     game_js = FLAPPY_JS if flappy else GAME_JS
     # Author: the MODEL writes the app for any spec; templates are the
     # offline/no-key fallback. Either way the pipeline below proves it.
+    # A failed model attempt is NEVER silent: it lands in report verdict
+    # context as model_error plus an explicit decision, both shown in studio.
     model_files = None
     author = ""
+    model_error = ""
+    tried: list = []
     try:
         from ..builder.codegen import generate_with_model
         style = "flappy" if flappy else "snake" if game else "none"
@@ -996,14 +1000,29 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
             author = (f"author: model {gen.get('model')} "
                       f"({len(model_files)} files, {gen.get('latency_ms', 0)}ms)")
         else:
-            author = f"author: offline template ({gen.get('error')})"
+            tried = list(gen.get("tried") or [])
+            model_error = str(gen.get("error") or "unknown model failure")
+            if tried:
+                model_error += f" [tried: {', '.join(tried)}]"
+                author = (f"MODEL GENERATION FAILED ({model_error}) — built "
+                          f"with offline template so nothing stops")
+            else:
+                author = f"author: offline template ({model_error})"
     except Exception as e:
-        author = f"author: offline template (codegen unavailable: {e})"
+        model_error = f"codegen unavailable: {e}"
+        author = f"author: offline template ({model_error})"
+    if tried:
+        decisions.append({"decision": "MODEL GENERATION FAILED: " + model_error,
+                          "reason": "The model was reached but did not deliver — "
+                                    "check MODEL_API_KEY and model IDs, then rebuild. "
+                                    "Template output below is real and verified, not AI-written."})
     decisions.append({"decision": author,
                       "reason": "The model wrote this app for your spec; the pipeline below still proves every step."
                                if model_files else
                                "Model path unavailable — templates carry the build so nothing stops."})
     report["author"] = author
+    if model_error and model_files is None:
+        report["model_error"] = model_error
     if model_files:
         for rel, content in model_files.items():
             ws.create_file(rel, content, overwrite=True)

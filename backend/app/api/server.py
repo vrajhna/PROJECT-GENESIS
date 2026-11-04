@@ -30,6 +30,53 @@ from ..builder.fullstack import (build_fullstack, detect_features, plan_question
 from ..builder.pipeline import build_and_verify
 from ..intelligence.meta_client import MetaClient
 from ..intelligence.model_router import ModelRouter
+from ..intelligence import meta_health as _meta_health
+
+# Meta health is checked ONCE in the background at startup (only when a key
+# exists) and on explicit refresh — never per request, never blocking boot.
+_meta_cache: dict = {"status": "unknown", "detail": "not checked yet",
+                     "models": [], "missing": [], "latency_ms": 0}
+
+
+def _refresh_meta_health() -> dict:
+    import os as _os
+    try:
+        from ..intelligence.meta_client import MetaConfig as _MetaCfg
+        cfg = _MetaCfg.from_env()
+        res = _meta_health.meta_health(cfg.api_key, cfg.advanced_model,
+                                       cfg.primary_model, cfg.base_url)
+    except Exception as e:
+        res = {"status": "unreachable", "detail": f"health check failed: {e}",
+               "models": [], "missing": [], "latency_ms": 0}
+    _meta_cache.clear()
+    _meta_cache.update(res)
+    return dict(_meta_cache)
+
+
+def _start_meta_check() -> None:
+    import os as _os
+    import threading as _th
+    if not _os.environ.get("MODEL_API_KEY"):
+        _meta_cache.update(status="no_key",
+                           detail="MODEL_API_KEY is not set — model features off, "
+                                  "templates carry every build")
+        return
+    _meta_cache.update(status="checking",
+                       detail="checking Meta API in the background…")
+
+    def _run() -> None:
+        try:
+            _refresh_meta_health()
+        except Exception:
+            pass
+    try:
+        t = _th.Thread(target=_run, daemon=True, name="genesis-meta-health")
+        t.start()
+    except Exception:
+        pass
+
+
+_start_meta_check()
 from ..intelligence.prompt_manager import render
 
 DATA_DIR = Path(__import__("os").environ.get("GENESIS_DATA_DIR", "/tmp/genesis-data"))
@@ -250,7 +297,13 @@ def health():
             status_code=503)
     db = "postgres" if mode == "server" else "sqlite/files"
     return {"ok": True, "service": "genesis", "time": time.time(),
-            "mode": mode, "db": db}
+            "mode": mode, "db": db, "meta": dict(_meta_cache)}
+
+
+@app.post("/api/settings/meta/check")
+def meta_check(request: Request):
+    """Re-run the Meta health probe on demand (bounded, synchronous)."""
+    return {"ok": True, "meta": _refresh_meta_health()}
 
 
 @app.post("/api/projects")

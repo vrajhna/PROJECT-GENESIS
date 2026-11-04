@@ -185,3 +185,132 @@ def test_live_wonder_writes_an_app():
         [], False, "none")
     assert out["ok"] is True, out.get("error")
     assert "wonder" in out["model"]
+
+
+MODEL_APP_FILES = {
+    "frontend/index.html": ("<html><head><title>Counter</title>"
+                             '<link rel="stylesheet" href="/style.css"></head>'
+                             "<body><h1>Counter</h1><canvas id=\"b\"></canvas>"
+                             '<script src="/app.js"></script></body></html>'),
+    "frontend/app.js": ("fetch('/api/health');\n"
+                        "document.addEventListener('click', () => {\n"
+                        "  fetch('/api/notes', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: 'n', data: {}})});\n"
+                        "});"),
+    "frontend/style.css": "body{}",
+    "backend/server.py": (
+        '"""model-written app (test double)."""\n'
+        "import json\n"
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
+        "NOTES = []\n"
+        "class H(BaseHTTPRequestHandler):\n"
+        "    def _send(self, payload, code=200):\n"
+        "        b = json.dumps(payload).encode()\n"
+        "        self.send_response(code)\n"
+        "        self.send_header('Content-Type', 'application/json')\n"
+        "        self.send_header('Content-Length', str(len(b)))\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(b)\n"
+        "    def _static(self, name, ctype):\n"
+        "        import os as _os\n"
+        "        p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'frontend', name)\n"
+        "        with open(p, 'rb') as f:\n"
+        "            b = f.read()\n"
+        "        self.send_response(200)\n"
+        "        self.send_header('Content-Type', ctype)\n"
+        "        self.send_header('Content-Length', str(len(b)))\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(b)\n"
+        "    def do_GET(self):\n"
+        "        from urllib.parse import urlparse\n"
+        "        path = urlparse(self.path).path\n"
+        "        if path == '/api/health':\n"
+        "            return self._send({'ok': True})\n"
+        "        if path in ('/', '/index.html'):\n"
+        "            return self._static('index.html', 'text/html; charset=utf-8')\n"
+        "        if path == '/app.js':\n"
+        "            return self._static('app.js', 'text/javascript; charset=utf-8')\n"
+        "        if path == '/style.css':\n"
+        "            return self._static('style.css', 'text/css; charset=utf-8')\n"
+        "        if path == '/api/notes':\n"
+        "            return self._send(NOTES)\n"
+        "        return self._send({'error': 'not found'}, 404)\n"
+        "    def do_POST(self):\n"
+        "        from urllib.parse import urlparse\n"
+        "        if urlparse(self.path).path != '/api/notes':\n"
+        "            return self._send({'error': 'not found'}, 404)\n"
+        "        n = int(self.headers.get('Content-Length') or 0)\n"
+        "        body = json.loads(self.rfile.read(n) or b'{}')\n"
+        "        NOTES.append({'name': body.get('name', ''), 'data': body.get('data', {})})\n"
+        "        return self._send({'ok': True})\n"
+        "    def log_message(self, *a):\n"
+        "        pass\n"
+        "if __name__ == '__main__':\n"
+        "    import sys as _sys\n"
+        "    port = int(_sys.argv[_sys.argv.index('--port') + 1]) if '--port' in _sys.argv else 8000\n"
+        '    ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()\n'
+    ),
+    "tests/test_app.py": (
+        "import json\nimport os\nimport urllib.request\n"
+        "BASE = 'http://127.0.0.1:' + os.environ.get('GENESIS_APP_PORT', '8000')\n"
+        "def call(path, payload=None):\n"
+        "    req = urllib.request.Request(BASE + path,\n"
+        "        data=json.dumps(payload).encode() if payload is not None else None,\n"
+        "        headers={'Content-Type': 'application/json'}, method='POST' if payload is not None else 'GET')\n"
+        "    with urllib.request.urlopen(req, timeout=10) as r:\n"
+        "        return r.status, r.read().decode()\n"
+        "def test_health():\n"
+        "    s, b = call('/api/health')\n"
+        "    assert s == 200 and '\"ok\": true' in b\n"
+        "def test_frontend_served():\n"
+        "    with urllib.request.urlopen(BASE + '/', timeout=10) as r:\n"
+        "        html = r.read().decode()\n"
+        "    assert '<canvas' in html\n"
+        "def test_notes_crud():\n"
+        "    s, _ = call('/api/notes', {'name': 'n1', 'data': {}})\n"
+        "    assert s == 200\n"
+        "    s, b = call('/api/notes')\n"
+        "    assert s == 200 and 'n1' in b\n"
+    ),
+    "requirements.txt": "pytest\n",
+    ".env.example": "SECRET_KEY=change-me\nPORT=8000\n",
+    "SETUP.md": "# Setup\n",
+}
+
+
+def _model_payload(files):
+    import json as _j
+    return {"output": [{"type": "message", "content": [{"type": "output_text", "text": _j.dumps({"files": files})}]}]}
+
+
+def test_model_authored_build_verifies_end_to_end(tmp_path, monkeypatch):
+    """The core claim, executed: model writes it, pipeline proves it."""
+    from types import SimpleNamespace
+    from app.builder import fullstack as fs
+    from app.intelligence import meta_client as mc
+
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            self.config = SimpleNamespace(api_key="test-key",
+                                          primary_model="muse-spark-1.3",
+                                          advanced_model="muse-wonder-1.0",
+                                          timeout_s=5)
+
+        def respond(self, model, user_input, task="adhoc", **kw):
+            seen["model"] = model
+            return {"ok": True, "data": _model_payload(MODEL_APP_FILES),
+                    "latency_ms": 9}
+
+    monkeypatch.setattr(mc, "MetaClient", FakeClient)
+    report = fs.build_fullstack("Build a tiny counter app with notes.",
+                                tmp_path / "modelapp",
+                                {"db": "sqlite", "payments": "none", "cache": "none"})
+    assert report["verdict"] == "VERIFIED", report
+    assert report.get("model_error", "") == ""
+    assert report["author"].startswith("author: model muse-wonder-1.0"), report["author"]
+    assert seen.get("model") == "muse-wonder-1.0"
+    assert any(d["decision"].startswith("author: model") for d in report["decisions"])
+    assert not any("MODEL GENERATION FAILED" in d["decision"] for d in report["decisions"])
+    html = (tmp_path / "modelapp" / "frontend" / "index.html").read_text()
+    assert "<canvas" in html
