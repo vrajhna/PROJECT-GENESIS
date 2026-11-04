@@ -645,7 +645,10 @@ def chat(pid: str, body: ChatIn, request: Request):
             _, prompt = render("plan.make", {"requirements": json.dumps(arch.data["requirements"])})
             routed = ModelRouter(client).run("routine codegen", prompt[:2000])
             if routed.get("ok"):
-                reply += " (Model note attached.)"
+                from ..builder.codegen import extract_text as _extract_text
+                note = _extract_text(routed.get("data") or {}).strip().replace("\n", " ")[:400]
+                if note:
+                    reply += " (Model note: " + note + ")"
         except Exception:
             pass
     return {"ok": True, "mode": "plan", "reply": reply,

@@ -545,6 +545,43 @@
   run_id → poll → VERIFIED with review/live/secure lanes + report.json.
   Full suite: `117 passed` (2 live tests deselected — need a valid key).
 
+## 2026-11-04 — Repair in place: chain traced, loop proven on a real app
+
+- STEP 1 diagnosis (frontend chat → API → model → orchestrator → agents →
+  tools → files → execution → test/repair → frontend), every link executed:
+  (1) chat input works; (2) API works; (3) Meta request FAILS with current
+  credentials — local key dead 401, Railway key gets model_not_found 404,
+  so codegen honestly falls back to templates (author line says so);
+  (4) orchestrator + runs/SSE work live; (5) agents are deterministic
+  specialists (Architect parse, Builder scaffold-or-model, Tester real
+  pytest, Reviewer static scan, Debugger heuristic) + ModelRouter for
+  codegen/chat only; (6) tools registry + approval gate work;
+  (7) workspace/patches work; (8) venv+pip+server+health work;
+  (9) real pytest works, repair = transient-retry only (no model repair
+  yet); (10) report/SSE/preview/publish work.
+- Smallest real fix shipped: the chat endpoint appended
+  "(Model note attached.)" WITHOUT reading the model reply. Now it
+  attaches the actual extracted model text (truncated) or nothing.
+- STEP 2+3 proof (`/tmp/genesis-acceptance.py`, log at
+  `/tmp/genesis-acceptance.log`): spec "Build a working task management
+  application with a frontend, backend and persistent database." →
+  VERIFIED in seconds; agents recorded per lane; 15 project files;
+  generated app booted standalone; POST/GET item CRUD 201/200 live;
+  frontend served; generated suite 4 passed live. Which agents ran:
+  Architect, Planner, Builder (template path — no valid key), Runner
+  (install/start/test), Debugger (not needed — no failures), Reviewer,
+  Secure, Verifier. Tools ran: workspace writes, venv+pip, server
+  subprocess, pytest, sqlite. Tests: 4/4 generated + full engine suite
+  green (see below).
+- Full engine suite after the fix: `127 passed` (2 live skips), typecheck
+  + build clean.
+- Still incomplete (no simulation, plain facts): (a) no valid Meta key
+  here, so model authorship is unproven — needs founder to paste the
+  /models NAME list (not the key) or set exact META_*_MODEL IDs;
+  (b) model-assisted repair is not built (failures stop with a report);
+  (c) `genesis.webstudiobhiwadi.com` DNS still points at Hostinger
+  parking (verified by nslookup) — Railway deploy is healthy.
+
 ## 2026-11-03 — No more "model not found", no more local on the website
 
 - Model fallback chain: Wonder first; on HTTP 404 / model_not_found the
