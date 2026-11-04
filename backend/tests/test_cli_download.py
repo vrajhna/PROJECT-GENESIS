@@ -31,9 +31,10 @@ def test_status_reports_backing_without_leaking_secrets(tmp_path):
 def test_cli_pack_downloads_and_runs(tmp_path):
     blob = _client(tmp_path).get("/api/download/cli").content
     names = zipfile.ZipFile(io.BytesIO(blob)).namelist()
-    assert "genesis-cli/genesis" in names
-    assert "genesis-cli/install.sh" in names
-    assert "genesis-cli/install.ps1" in names
+    assert "genesis" in names
+    assert "install.sh" in names
+    assert "install.ps1" in names
+    assert not any(n.startswith("genesis-cli/") for n in names)
 
 
 def test_engine_pack_contains_server_and_cli(tmp_path):

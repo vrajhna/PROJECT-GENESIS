@@ -1096,7 +1096,13 @@ def download_install_ps1():
 
 @app.get("/api/download/cli")
 def download_cli():
-    blob = _zip_tree(REPO_ROOT, ["genesis-cli"], "")
+    try:
+        rels = sorted(p.name for p in CLI_DIR.iterdir() if not p.name.startswith("."))
+    except OSError:
+        rels = []
+    if not rels:
+        return JSONResponse({"ok": False, "error": "cli pack missing on server"}, status_code=500)
+    blob = _zip_tree(CLI_DIR, rels, "")
     if not blob:
         return JSONResponse({"ok": False, "error": "cli pack missing on server"}, status_code=500)
     return StreamingResponse(iter([blob]), media_type="application/zip",
