@@ -14,18 +14,24 @@ PROMPTS: dict[str, dict[str, str]] = {
     },
     "repair.propose": {
         "v1": "Propose the minimal patch fixing this failure. Touch the fewest files possible. State which tests prove the fix and which regressions to run.\n\nFAILURE:\n{failure}",
+        "v2": ("You are Genesis Repair. Given a failure diagnosis and exact file contents, output ONLY a JSON object "
+               "(no prose, no fences): {{\"patches\": [{{\"path\": \"<project-relative path>\", \"find\": \"<exact text to replace, "
+               "must match exactly once>\", \"replace\": \"<new text>\"}}], \"summary\": \"<one line>\"}}. Rules: minimal patches, "
+               "fewest files; never edit tests to make them pass unless the test itself is the bug (then say so in summary); "
+               "never add secrets, API keys or passwords; the backend must keep binding 127.0.0.1; never reference parent "
+               "directories or absolute paths. If no safe patch exists, return {{\"patches\": []}}.\n\nFAILURE:\n{failure}"),
     },
     "codegen.fullstack": {
         "v1": ("You are Genesis, an autonomous software engineer. Write a COMPLETE small full-stack app as a JSON file map. Output ONLY JSON, no prose, no fences: {{\"files\": {{\"<path>\": \"<content>\", ...}}}}.\n\n"
                "SPECIFICATION:\n{spec}\n\nREQUIREMENTS:\n{requirements}\nRESOURCES: {resources}\nAUTH: {auth}\nGAME: {game}\n\n"
                "CONTRACT (every generated app must obey it — a test harness will execute it):\n"
                "1. backend/server.py — Python STDLIB ONLY (http.server, sqlite3, json, hashlib, secrets, urllib.parse). No pip packages.\n"
-               "   Binds 127.0.0.1 only, port from argv --port or GENESIS_APP_PORT env (default 8000). SQLite file backend/app.db next to the script.\n"
+               "   Binds GENESIS_BIND env if set else 127.0.0.1 — write the bind host EXACTLY as os.environ.get(\"GENESIS_BIND\", \"127.0.0.1\") (the Genesis sandbox sets GENESIS_BIND=0.0.0.0 inside its disposable container, which is still published only on host loopback — a loopback-only bind inside the container is UNREACHABLE and fails verification), port from argv --port or GENESIS_APP_PORT env (default 8000). SQLite file backend/app.db next to the script.\n"
                "   Routes: GET /api/health -> {{\"ok\": true}}. Static frontend/ served at / with correct content types (/app.js, /style.css).\n"
                "   For EACH resource in RESOURCES: GET /api/<r> (list), POST /api/<r> with {{\"name\", \"data\"}} (create). Strict resource-name regex, seeded with one row.\n"
                '   If "score" in RESOURCES: also GET /api/scores and POST /api/scores {{"name", "data": {{"score": number}}}}.\n'
                "   If AUTH is on: POST /api/register {{username, password}} (salted sha256, unique), POST /api/login -> {{token}}, Bearer tokens for writes.\n"
-               "   Rate limit 120 req/min/IP in memory. migrate() idempotent on boot. Localhost bind mandatory.\n"
+               "   Rate limit 120 req/min/IP in memory. migrate() idempotent on boot. GENESIS_BIND honored (default 127.0.0.1).\n"
                "2. frontend/index.html — static page, fetches SAME-ORIGIN relative paths only (/api/...). Title from the spec. If GAME is not none: a <canvas> game (gravity/pipes for flappy-like, grid for snake-like, invent freely otherwise), score display, name prompt on game over posting to /api/scores, top-10 scoreboard sorted desc, tap/click/space controls, phone-friendly viewport.\n"
                "3. frontend/app.js, frontend/style.css — the page logic and plain styling. No frameworks, no CDN, no external URLs.\n"
                "4. tests/test_app.py — urllib-based tests: BASE from GENESIS_APP_PORT env (default 8000); test /api/health, each resource CRUD, and <canvas> presence when GAME. Must pass against the server above.\n"
@@ -34,6 +40,18 @@ PROMPTS: dict[str, dict[str, str]] = {
                "Keep every file small and complete. Total output under 60KB."),
     },
 }
+
+
+# v2 (2026-11-04): v1 asked for GENESIS_BIND in prose and Wonder ignored it
+# (proven live: hardcoded 127.0.0.1, unreachable in Docker). v2 names the
+# exact mandatory lines; codegen.ensure_sandbox_bind() is the deterministic
+# backstop for models that still ignore it.
+_V1_BIND_CLAUSE = "Binds GENESIS_BIND env if set else 127.0.0.1 (the Genesis sandbox sets GENESIS_BIND=0.0.0.0 inside its disposable container, which is still published only on host loopback — a loopback-only bind inside the container is UNREACHABLE and fails verification)"
+assert _V1_BIND_CLAUSE in PROMPTS["codegen.fullstack"]["v1"], "codegen.fullstack v1 changed; update v2 derivation"
+PROMPTS["codegen.fullstack"]["v2"] = PROMPTS["codegen.fullstack"]["v1"].replace(
+    _V1_BIND_CLAUSE,
+    "MANDATORY BIND CODE — copy these exact lines (the harness rejects any server without them): host = os.environ.get(\"GENESIS_BIND\", \"127.0.0.1\") then serve (host, port); import os at the top of backend/server.py. The sandbox sets GENESIS_BIND=0.0.0.0 inside its disposable container (still published only on host loopback) — a hardcoded 127.0.0.1 bind there is UNREACHABLE and fails verification, and a hardcoded 0.0.0.0 default is rejected as insecure.",
+)
 
 
 def get_prompt(name: str, version: str = "latest") -> tuple[str, str]:

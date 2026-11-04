@@ -70,6 +70,18 @@ class FakeRouter:
                 "latency_ms": 42, "task_kind": task_kind}
 
 
+def test_codegen_prompt_requires_sandbox_bind():
+    """Regression: under the Docker sandbox a loopback-only bind inside the
+    container is unreachable from the host (proven live). The contract must
+    require GENESIS_BIND honoring with a 127.0.0.1 default."""
+    from app.intelligence.prompt_manager import render
+    _, prompt = render("codegen.fullstack", {
+        "spec": "s", "requirements": "- R: x", "resources": "item",
+        "auth": "off", "game": "none"})
+    assert "GENESIS_BIND" in prompt
+    assert "UNREACHABLE" in prompt
+
+
 def test_ok_path_uses_wonder_and_records_author():
     router = FakeRouter()
     out = generate(router=router)
@@ -200,6 +212,7 @@ MODEL_APP_FILES = {
     "backend/server.py": (
         '"""model-written app (test double)."""\n'
         "import json\n"
+        "import os\n"
         "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
         "NOTES = []\n"
         "class H(BaseHTTPRequestHandler):\n"
@@ -247,7 +260,7 @@ MODEL_APP_FILES = {
         "if __name__ == '__main__':\n"
         "    import sys as _sys\n"
         "    port = int(_sys.argv[_sys.argv.index('--port') + 1]) if '--port' in _sys.argv else 8000\n"
-        '    ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()\n'
+        '    ThreadingHTTPServer((os.environ.get("GENESIS_BIND", "127.0.0.1"), port), H).serve_forever()\n'
     ),
     "tests/test_app.py": (
         "import json\nimport os\nimport urllib.request\n"
