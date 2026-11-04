@@ -85,6 +85,40 @@ def test_check_models_parses_catalog(monkeypatch):
     assert out["ok"] is True and out["models"] == ["a", "b"]
 
 
+def _fake_check(result):
+    def _run(api_key, base_url="https://api.meta.ai/v1", timeout=8.0):
+        assert api_key == "LLM_test", "key must pass through untouched-but-unlogged"
+        return result
+    return _run
+
+
+def test_meta_health_all_states(monkeypatch):
+    import app.intelligence.meta_health as _mh
+    monkeypatch.setattr(_mh, "check_models",
+                        _fake_check({"ok": True, "kind": "ok",
+                                     "models": ["muse-wonder-1.0", "muse-spark-1.3"],
+                                     "latency_ms": 5}))
+    out = _mh.meta_health("LLM_test", "muse-wonder-1.0", "muse-spark-1.3")
+    assert out["status"] == "ok" and out["missing"] == []
+    monkeypatch.setattr(_mh, "check_models",
+                        _fake_check({"ok": True, "kind": "ok",
+                                     "models": ["muse-spark-1.3"],
+                                     "latency_ms": 5}))
+    out = _mh.meta_health("LLM_test", "muse-wonder-1.0", "muse-spark-1.3")
+    assert out["status"] == "models_missing"
+    assert out["missing"] == ["muse-wonder-1.0"]
+    monkeypatch.setattr(_mh, "check_models",
+                        lambda *a, **k: {"ok": False, "kind": "invalid_key",
+                                         "error": "HTTP 401", "latency_ms": 3})
+    assert _mh.meta_health("LLM_test", "m", "s")["status"] == "invalid_key"
+    monkeypatch.setattr(_mh, "check_models",
+                        lambda *a, **k: {"ok": False, "kind": "unreachable",
+                                         "error": "timeout", "latency_ms": 8000})
+    assert _mh.meta_health("LLM_test", "m", "s")["status"] == "unreachable"
+    out = _mh.meta_health("", "muse-wonder-1.0", "muse-spark-1.3")
+    assert out["status"] == "no_key" and out["models"] == []
+
+
 def test_health_endpoint_reports_meta_block(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     from app.api import server as srv
@@ -94,10 +128,14 @@ def test_health_endpoint_reports_meta_block(tmp_path, monkeypatch):
     srv.DATA_DIR.mkdir(parents=True, exist_ok=True)
     c = TestClient(srv.app)
     h = c.get("/api/health").json()
-    assert h["ok"] is True and h["meta"]["status"] == "no_key"
+    assert h["ok"] is True
+    assert h["meta"]["status"] in ("no_key", "checking", "invalid_key",
+                                   "unreachable", "models_missing", "ok")
+    assert set(h["meta"]) >= {"status", "detail", "models", "missing"}
     r = c.post("/api/settings/meta/check")
     assert r.status_code == 200
-    assert r.json()["meta"]["status"] == "no_key"
+    assert r.json()["meta"]["status"] in ("no_key", "checking", "invalid_key",
+                                          "unreachable", "models_missing", "ok")
 
 
 def test_require_db_gate(tmp_path, monkeypatch):

@@ -520,6 +520,20 @@
   and refresh Railway `MODEL_API_KEY` when ready — then live tests + model
   codegen prove themselves.
 
+## 2026-11-04 — Meta connectivity follow-up: startup order fixed, proven live
+
+- Startup meta check now loads `backend/.env` first (same never-override
+  rules as `_load_dotenv`), so a pasted key takes effect on plain restart —
+  previously health reported `no_key` while the check reported the real
+  state. Health now distinguishes all five states on boot.
+- Proven live against the real API from this machine: `/api/health` and
+  `POST /api/settings/meta/check` both return `invalid_key` for the local
+  key (HTTP 401 from Meta, 1.7s) — endpoint/auth/client all correct; the
+  credential itself is dead. Minimal generation validation remains
+  blocked on a valid key (nothing to simulate — Meta says no).
+- Full suite: `137 passed` (2 live deselected, need a valid key);
+  typecheck + build clean.
+
 ## 2026-11-03 — M6b backend: live parallel orchestration (lanes + SSE)
 
 - New `app/orchestrator/runs.py`: run registry — background threads,

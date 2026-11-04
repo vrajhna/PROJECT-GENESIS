@@ -55,6 +55,22 @@ def _refresh_meta_health() -> dict:
 
 def _start_meta_check() -> None:
     import os as _os
+    # Local backend/.env is the documented dev flow — load it BEFORE the
+    # check so a fresh key takes effect on plain restart (same rules as
+    # _load_dotenv below: never overrides real env, never logged).
+    try:
+        import pathlib as _pl
+        _root = _pl.Path(__file__).resolve().parent.parent.parent
+        for _ln in (_root / ".env").read_text(encoding="utf-8").splitlines():
+            _ln = _ln.strip()
+            if not _ln or _ln.startswith("#") or "=" not in _ln:
+                continue
+            _k, _v = _ln.split("=", 1)
+            _k, _v = _k.strip(), _v.strip().strip("'\"")
+            if _k and _k not in _os.environ:
+                _os.environ[_k] = _v
+    except Exception:
+        pass
     import threading as _th
     if not _os.environ.get("MODEL_API_KEY"):
         _meta_cache.update(status="no_key",
@@ -80,6 +96,7 @@ _start_meta_check()
 from ..intelligence.prompt_manager import render
 
 DATA_DIR = Path(__import__("os").environ.get("GENESIS_DATA_DIR", "/tmp/genesis-data"))
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Genesis", version="0.1.0")
