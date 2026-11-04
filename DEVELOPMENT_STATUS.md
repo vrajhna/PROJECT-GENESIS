@@ -519,3 +519,28 @@
   byte-identical. Founder: paste a fresh key into `backend/.env` (local)
   and refresh Railway `MODEL_API_KEY` when ready — then live tests + model
   codegen prove themselves.
+
+## 2026-11-03 — M6b backend: live parallel orchestration (lanes + SSE)
+
+- New `app/orchestrator/runs.py`: run registry — background threads,
+  per-step records `{step, ok, detail, evidence, lane, ts}`, status
+  running/done/failed, error capture (a run can never hang SSE).
+- `build_fullstack(..., on_step=None)`: every finished step carries its
+  lane (`architect/planner/builder/live/debugger/review/secure/verify`)
+  and streams to the callback. Report keeps completion order (no test
+  asserted the old order; verified).
+- Real parallelism, same gates: ReviewerAgent runs SIMULTANEOUSLY with
+  the install/start/test chain (static scan needs only the tree);
+  secure scan runs alongside retest. Attempt-retry, transient-only and
+  all gate semantics unchanged; pool shutdown on every exit path
+  (non-daemon threads would otherwise hang the process — caught in
+  review, fixed before any test ran).
+- API: `POST /api/projects/{pid}/fullstack?stream=true` returns
+  `{run_id}` immediately (blocking default unchanged);
+  `GET .../build/status?run_id=` for polling;
+  `GET .../build/stream?run_id=` SSE (`start/step/done` events, 20s
+  keepalive waits). report.json still written on completion.
+- Tests: `test_runs.py` — registry order/crash/unknown, SSE framing
+  (2 step events + done, 404s), and a REAL streamed build end to end:
+  run_id → poll → VERIFIED with review/live/secure lanes + report.json.
+  Full suite: `117 passed` (2 live tests deselected — need a valid key).

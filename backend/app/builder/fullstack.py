@@ -887,22 +887,37 @@ def _secure_scan(workdir: Path, chosen: dict) -> list[str]:
 
 
 def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
-                    max_attempts: int = 2, timeout_s: int = 600) -> dict:
+                    max_attempts: int = 2, timeout_s: int = 600,
+                    on_step=None) -> dict:
     """Run the pipeline. Returns the report with per-step evidence.
 
     Keeps working automatically on TRANSIENT failures (timeouts, health
     flakes) up to max_attempts. Terminal failures (bad tests, review
     findings, bad input) stop with an actionable report — never an
     infinite loop.
+
+    Agents run in LANES: the live chain (install/start/test) and the
+    static review work simultaneously; secure scan and retest run together.
+    Every finished step is also pushed to on_step(rec) for live streaming.
     """
     steps: list[dict] = []
     report: dict = {"spec": spec, "steps": steps, "verdict": "FAILED", "attempts": 0}
 
-    def step(name: str, ok: bool, detail: str = "", evidence: str = "") -> None:
-        steps.append({"step": name, "ok": ok, "detail": detail, "evidence": evidence[:2000]})
+    import time as _time
+
+    def step(name: str, ok: bool, detail: str = "", evidence: str = "",
+             lane: str = "main") -> None:
+        rec = {"step": name, "ok": ok, "detail": detail,
+               "evidence": evidence[:2000], "lane": lane, "ts": _time.time()}
+        steps.append(rec)
+        if on_step is not None:
+            try:
+                on_step(rec)
+            except Exception:
+                pass
 
     arch = ArchitectAgent().run(spec)
-    step("understand", arch.ok, arch.summary)
+    step("understand", arch.ok, arch.summary, lane="architect")
     if not arch.ok:
         report["verdict"] = "BLOCKED"
         report["reason"] = arch.summary
@@ -912,7 +927,7 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
     except ValueError as e:
         report["verdict"] = "BLOCKED"
         report["reason"] = str(e)
-        step("plan", False, str(e))
+        step("plan", False, str(e), lane="planner")
         return report
     reqs = arch.data["requirements"]
     features = detect_features(reqs)
@@ -925,7 +940,7 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
     decisions = decide_stack(reqs, features, resources, chosen)
     step("plan", True, f"{len(reqs)} requirements → {', '.join(resources)}"
          + (" + auth" if features["auth"] else "") + ".",
-         "; ".join(d["decision"] for d in decisions))
+         "; ".join(d["decision"] for d in decisions), lane="planner")
     if game:
         decisions.append({"decision": f"game mode: canvas {game_name} + score API + scoreboard",
                           "reason": "Spec asks for a playable game; scores persist like any other resource."})
@@ -1005,7 +1020,7 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
                            "python3 backend/server.py --port 8000\n```\nOpen http://127.0.0.1:8000\n",
                            overwrite=True)
         step("generate", True,
-             f"model wrote {len(model_files)} files for: {title[:80]}.")
+             f"model wrote {len(model_files)} files for: {title[:80]}.", lane="builder")
     else:
         index_src = (game_html if game else INDEX_TEMPLATE).replace("__TITLE__", title)
         index_src = index_src.replace("__TAGLINE__",
@@ -1046,18 +1061,18 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
                        overwrite=True)
         step("generate", True,
              ((f"game: canvas {game_name} + score API + tests for score.") if game
-              else f"frontend (3 files) + backend + SQLite schema + tests for {', '.join(resources)}."))
+              else f"frontend (3 files) + backend + SQLite schema + tests for {', '.join(resources)}."), lane="builder")
 
     venv = workdir / ".venv"
     try:
         proc = subprocess.run(["python3", "-m", "venv", str(venv)],
                               capture_output=True, text=True, timeout=120, shell=False)
     except subprocess.TimeoutExpired:
-        step("install", False, "venv creation timed out.")
+        step("install", False, "venv creation timed out.", lane="live")
         report["reason"] = "venv creation timed out"
         return report
     if proc.returncode != 0:
-        step("install", False, f"venv failed: {proc.stderr[-500:]}")
+        step("install", False, f"venv failed: {proc.stderr[-500:]}", lane="live")
         report["reason"] = "venv creation failed"
         return report
     import os as _os
@@ -1085,6 +1100,11 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
     out = ""
     port = 0
     server = None
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="genesis-lane")
+    # Review needs only the generated tree: it runs SIMULTANEOUSLY with the
+    # live install/start/test chain instead of after it. Same gate, less wait.
+    fut_review = pool.submit(ReviewerAgent().run, workdir)
     for _ in range(max_attempts + 1):
         report["attempts"] += 1
         _stop(server)
@@ -1097,11 +1117,12 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
                            else f"pip failed: {(proc.stdout + proc.stderr)[-500:]}")
         except subprocess.TimeoutExpired:
             ok_install, install_msg = False, "pip install timed out."
-        step("install", ok_install, install_msg)
+        step("install", ok_install, install_msg, lane="live")
         if not ok_install:
             launch_err.append(install_msg)
             if not _is_transient(install_msg):
                 report["reason"] = "dependency install failed"
+                pool.shutdown(wait=True)
                 return report
             continue
         port = _free_port()
@@ -1117,7 +1138,7 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
         step("start", healthy,
              f"app serving on 127.0.0.1:{port} (health-checked)." if healthy
              else "app did not become healthy in time.",
-             f"preview_url=http://127.0.0.1:{port}")
+             f"preview_url=http://127.0.0.1:{port}", lane="live")
         if healthy:
             report["preview_url"] = f"http://127.0.0.1:{port}"
         else:
@@ -1126,6 +1147,7 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
                 report["reason"] = "app failed health check"
                 _stop(server)
                 server = None
+                pool.shutdown(wait=True)
                 return report
             continue
         env = dict(_os.environ, GENESIS_APP_PORT=str(port))
@@ -1137,49 +1159,55 @@ def build_fullstack(spec: str, workdir: Path, answers: dict | None = None,
         failed_tests = sorted(set(_re.findall(r"^FAILED (\S+)", out, _re.M)))
         ok = test_proc.returncode == 0
         step("test", ok, f"pytest exit {test_proc.returncode}: {passed} passed.",
-             out.strip().splitlines()[-1] if out.strip() else "")
+             out.strip().splitlines()[-1] if out.strip() else "", lane="live")
         report["test_output"] = out
         if not ok:
             test_err.append(f"tests failed: {', '.join(failed_tests) or 'see output'}")
             diag = DebuggerAgent().run({"id": "F-001", "category": "test-failure",
                                         "logs": out, "files": ["backend/server.py"]})
-            step("diagnose", True, diag.summary, str(diag.data.get("suspected_root_cause", ""))[:500])
+            step("diagnose", True, diag.summary, str(diag.data.get("suspected_root_cause", ""))[:500], lane="debugger")
             report["diagnosis"] = diag.data
             if not _is_transient(out):
                 report["reason"] = test_err[-1]
                 _stop(server)
                 server = None
+                pool.shutdown(wait=True)
                 return report
             continue
-        review = ReviewerAgent().run(workdir)
-        step("review", review.ok, review.summary)
+        review = fut_review.result()
+        step("review", review.ok, review.summary, lane="review")
         if not review.ok:
             review_err.append(review.summary)
             report["findings"] = review.data["findings"]
             report["reason"] = review.summary
             _stop(server)
             server = None
-            return report
-        sec_findings = _secure_scan(workdir, chosen)
-        step("secure", not sec_findings,
-             "stdlib-only, localhost bind, no live secrets." if not sec_findings
-             else "; ".join(sec_findings))
-        if sec_findings:
-            report["reason"] = "security gate: " + "; ".join(sec_findings)
-            _stop(server)
-            server = None
+            pool.shutdown(wait=True)
             return report
         break
     else:
         report["reason"] = "; ".join(launch_err + test_err + review_err) or "build attempts exhausted"
         _stop(server)
+        pool.shutdown(wait=True)
         return report
+    # Secure scan and retest are independent: they run SIMULTANEOUSLY.
+    fut_secure = pool.submit(_secure_scan, workdir, chosen)
     try:
         log_text = log_path.read_text(encoding="utf-8")[-2000:]
     except OSError:
         log_text = ""
     step("logs", True, "server log captured.", log_text)
-    step("retest", True, f"{passed} passed on the final tree; app still healthy: {_wait_healthy(port, 5)}.")
+    step("retest", True, f"{passed} passed on the final tree; app still healthy: {_wait_healthy(port, 5)}.", lane="verify")
+    sec_findings = fut_secure.result()
+    step("secure", not sec_findings,
+         "stdlib-only, localhost bind, no live secrets." if not sec_findings
+         else "; ".join(sec_findings), lane="secure")
+    pool.shutdown(wait=True)
+    if sec_findings:
+        report["reason"] = "security gate: " + "; ".join(sec_findings)
+        _stop(server)
+        server = None
+        return report
     report["verdict"] = "VERIFIED"
     report["reason"] = f"{passed} test(s) passed against the live full-stack app, review clean."
     _stop(server)

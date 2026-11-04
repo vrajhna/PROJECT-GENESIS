@@ -578,7 +578,8 @@ def fullstack_questions(pid: str, request: Request):
 
 
 @app.post("/api/projects/{pid}/fullstack")
-def build_fullstack_app(pid: str, request: Request, body: FullstackIn | None = None):
+def build_fullstack_app(pid: str, request: Request, body: FullstackIn | None = None,
+                          stream: bool = False):
     if load_project(pid) is None:
         return err(request, "unknown project", 404)
     meta = load_project(pid)
@@ -596,9 +597,68 @@ def build_fullstack_app(pid: str, request: Request, body: FullstackIn | None = N
             (workdir / stale).unlink()
         except OSError:
             pass
+    if stream:
+        # Live mode: the build runs in a background thread, steps stream
+        # over SSE as agents finish them. Blocking mode below is unchanged.
+        from ..orchestrator import runs as runstore
+
+        def _run_fullstack(**kw):
+            rep = build_fullstack(meta["spec"], workdir, answers=chosen, **kw)
+            try:
+                (proj_dir(pid) / "report.json").write_text(
+                    json.dumps(rep, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+            return rep
+
+        run_id = runstore.start_run(pid, "fullstack", _run_fullstack)
+        return {"ok": True, "run_id": run_id}
     report = build_fullstack(meta["spec"], workdir, answers=chosen)
     (proj_dir(pid) / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return {"ok": report["verdict"] == "VERIFIED", "report": report}
+
+
+@app.get("/api/projects/{pid}/build/status")
+def build_status(pid: str, request: Request, run_id: str = ""):
+    from ..orchestrator import runs as runstore
+    run = runstore.get_run(run_id)
+    if not run or run["pid"] != pid:
+        return err(request, "unknown run", 404)
+    return {"ok": True, "run": {
+        "id": run["id"], "pid": run["pid"], "kind": run["kind"],
+        "status": run["status"], "steps": run["steps"],
+        "error": run["error"], "started_at": run["started_at"],
+        "report": run["report"],
+    }}
+
+
+@app.get("/api/projects/{pid}/build/stream")
+def build_stream(pid: str, request: Request, run_id: str = ""):
+    from ..orchestrator import runs as runstore
+    run = runstore.get_run(run_id)
+    if not run or run["pid"] != pid:
+        return err(request, "unknown run", 404)
+
+    def events():
+        yield f"event: start\ndata: {json.dumps({'run_id': run_id})}\n\n"
+        idx = 0
+        while True:
+            snap = runstore.get_run(run_id)
+            if not snap:
+                break
+            while idx < len(snap["steps"]):
+                st = snap["steps"][idx]
+                idx += 1
+                yield f"event: step\ndata: {json.dumps(st)}\n\n"
+            if snap["status"] in ("done", "failed"):
+                yield ("event: done\ndata: " + json.dumps({
+                    "status": snap["status"], "report": snap["report"],
+                    "error": snap["error"]}) + "\n\n")
+                break
+            runstore.wait_done(run_id, timeout=20)
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/intelligence/status")
