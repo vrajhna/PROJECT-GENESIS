@@ -4,7 +4,7 @@ Autonomous software engineering intelligence. From specification to verified sof
 
 ## What's in here
 
-- `backend/` — FastAPI API, agent roles, tool registry, memory, improvement loop, DB schema, pipeline, 47-test suite
+- `backend/` — FastAPI API, agent roles, tool registry, memory, improvement loop, DB schema, pipeline, 178-test suite
 - `frontend/` — Next.js editor-style console (the studio workspace + spec docs part-i … part-ix)
 - `ARCHITECTURE.md`, `IMPLEMENTATION_PLAN.md`, `DEVELOPMENT_STATUS.md` — design, plan, running ledger
 - `.env.example` — copy to `.env` and fill `MODEL_API_KEY` for live model calls
@@ -56,3 +56,10 @@ npm run build && npx next start -p 3101   # open http://localhost:3101
 ## What it does
 
 Describe what to build in one sentence → the model designs the app (no templates, no keyword steering) → agents install, run, test, diagnose, repair and verify it in an isolated Docker sandbox → you get a live preview, a runnable ZIP, and one-click publish. Every claim in every report comes from executed evidence.
+
+## License
+
+MIT — see [LICENSE](LICENSE). © Vrajhna Technologies Pvt. Ltd.
+
+Genesis is built by [WebStudio Bhiwadi](https://webstudiobhiwadi.com).
+Generated applications carry no Genesis license restrictions.
