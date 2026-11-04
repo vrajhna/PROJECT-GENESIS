@@ -544,3 +544,19 @@
   (2 step events + done, 404s), and a REAL streamed build end to end:
   run_id → poll → VERIFIED with review/live/secure lanes + report.json.
   Full suite: `117 passed` (2 live tests deselected — need a valid key).
+
+## 2026-11-03 — M6c: live agent cards in the studio (EventSource UI)
+
+- `Workspace.tsx`: `Build full app` now streams — POST `?stream=true`
+  returns a run id instantly, then an `EventSource` consumes
+  `/build/stream` step events into a **live crew** panel (§4): Architect,
+  Planner, Builder, Runner, Debugger, Reviewer, Secure, Verifier cards
+  flip queued → working → done/failed with the latest detail, including
+  while lanes overlap. On `done` the normal report + preview + publish
+  flow takes over; stream drops fall back with an honest notice.
+- Proven live locally: restarted API + editor by exact PID, ran a real
+  streamed build — 10 lane-tagged step events arrived over SSE
+  (review stamped the same second as test, secure with retest),
+  `done` + VERIFIED. New bundle verified serving (`live crew` +
+  `EventSource` in the client JS, HTTP 200).
+- Typecheck + build clean.

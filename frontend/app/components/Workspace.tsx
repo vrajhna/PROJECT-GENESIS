@@ -1,8 +1,19 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_GENESIS_API || "http://127.0.0.1:8000";
+
+const AGENTS = [
+  { lane: "architect", label: "Architect", desc: "spec → requirements" },
+  { lane: "planner", label: "Planner", desc: "stack choices" },
+  { lane: "builder", label: "Builder", desc: "model writes the code" },
+  { lane: "live", label: "Runner", desc: "install → start → test" },
+  { lane: "debugger", label: "Debugger", desc: "diagnosis on failure" },
+  { lane: "review", label: "Reviewer", desc: "static audit, in parallel" },
+  { lane: "secure", label: "Secure", desc: "gates, in parallel" },
+  { lane: "verify", label: "Verifier", desc: "final retest" },
+];
 
 interface Step {
   step: string;
@@ -225,6 +236,17 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   }
   const [questions, setQuestions] = useState<any[]>([]);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [runSteps, setRunSteps] = useState<any[]>([]);
+  const [runStatus, setRunStatus] = useState<"idle" | "running" | "done" | "failed">("idle");
+  const esRef = useRef<EventSource | null>(null);
+
+  useEffect(() => () => {
+    try {
+      esRef.current?.close();
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   async function fetchQuestions() {
     if (!pid) return;
@@ -324,15 +346,14 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
 
   async function build(kind: "build" | "fullstack") {
     if (!pid) return setNotice("Create a project first.");
-    setBusy(kind === "fullstack"
-      ? "Building full app — frontend, API, database, tests. Takes a few minutes…"
-      : "Building — scaffold, install, start, test. This takes a minute…");
+    if (kind === "fullstack") return buildStreamed();
+    setBusy("Building — scaffold, install, start, test. This takes a minute…");
     setReport(null);
     try {
       const r = await fetch(`${API}/api/projects/${pid}/${kind}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: kind === "fullstack" ? JSON.stringify({ answers }) : "{}",
+        body: "{}",
       });
       const j = await r.json();
       setReport(j.report);
@@ -342,6 +363,79 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       setNotice("Build request failed — is the backend still running?");
     }
     setBusy("");
+  }
+
+  async function buildStreamed() {
+    try {
+      esRef.current?.close();
+    } catch {
+      /* ignore */
+    }
+    setRunSteps([]);
+    setRunStatus("running");
+    setReport(null);
+    setPubUrl("");
+    let runId = "";
+    try {
+      const r = await fetch(`${API}/api/projects/${pid}/fullstack?stream=true`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answers }),
+      });
+      const j = await r.json();
+      if (!j.ok || !j.run_id) throw new Error(j.error || "stream start failed");
+      runId = j.run_id;
+    } catch {
+      setRunStatus("idle");
+      return setNotice("Could not start the live build — is the backend still running?");
+    }
+    setBusy("Building live — agents working in parallel. Watch §4.");
+    await new Promise<void>((resolve) => {
+      const es = new EventSource(`${API}/api/projects/${pid}/build/stream?run_id=${runId}`);
+      esRef.current = es;
+      es.addEventListener("step", (ev) => {
+        try {
+          const st = JSON.parse((ev as MessageEvent).data);
+          setRunSteps((prev) => [...prev, st]);
+        } catch {
+          /* ignore */
+        }
+      });
+      es.addEventListener("done", (ev) => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          if (d.status === "done" && d.report) {
+            setReport(d.report);
+            setRunStatus("done");
+            setNotice(d.report.verdict === "VERIFIED" ? "Verified. Preview, download, or publish it." : `Not verified: ${d.report.reason}`);
+          } else {
+            setRunStatus("failed");
+            setNotice("Build failed: " + (d.error || "see server log"));
+          }
+        } catch {
+          setRunStatus("failed");
+        }
+        try {
+          es.close();
+        } catch {
+          /* ignore */
+        }
+        refreshTree();
+        setBusy("");
+        resolve();
+      });
+      es.onerror = () => {
+        try {
+          es.close();
+        } catch {
+          /* ignore */
+        }
+        setRunStatus("idle");
+        setBusy("");
+        setNotice("Stream dropped — the build may still finish; press Build full app again to retry live.");
+        resolve();
+      };
+    });
   }
 
   async function refreshTree(id?: string) {
@@ -742,7 +836,25 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
 
       <section>
         <h2 className="sect">4 · Watch it work</h2>
-        {!report && <p className="prose">No build yet. Activity appears here step by step — install, start, test, review.</p>}
+        {!report && runSteps.length === 0 && <p className="prose">No build yet. Activity appears here step by step — install, start, test, review.</p>}
+        {(runStatus === "running" || (runSteps.length > 0 && !report)) && (
+          <div style={{ marginTop: 12 }}>
+            <p className="prose"><span className="hl">live crew</span> {runStatus === "running" ? "agents working in parallel — steps land as they finish." : "stream ended, waiting on the final report."}</p>
+            <ol className="rows">
+              {AGENTS.map((a) => {
+                const mine = runSteps.filter((s) => s.lane === a.lane);
+                const bad = mine.find((s) => !s.ok);
+                const last = mine[mine.length - 1];
+                const live = runStatus === "running" && runSteps.length > 0 && runSteps[runSteps.length - 1].lane === a.lane && !bad;
+                const cls = bad ? "" : last ? "done" : live ? "partial" : "queued";
+                const mark = bad ? "✕" : last ? "●" : live ? "◐" : "○";
+                return (
+                  <li key={a.lane}><span /><span className={`g ${cls}`} style={bad ? { color: "#f66" } : undefined}>{mark}</span><span><span className="t">{a.label} <span style={{ opacity: 0.7 }}>· {a.desc}</span></span><span className="e">{bad ? "failed: " + bad.detail : last ? last.detail : live ? "working…" : "queued"}</span></span></li>
+                );
+              })}
+            </ol>
+          </div>
+        )}
         {report && (
           <>
             <p className="prose">verdict: <span className="hl">{report.verdict}</span> {report.reason}</p>
