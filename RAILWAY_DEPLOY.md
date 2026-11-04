@@ -25,7 +25,11 @@ Railway project → **+ New → Database → Postgres**. Note its
 - **Variables:**
   - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}` (reference the plugin)
   - `GENESIS_DATA_DIR` = `/data`
+  - `GENESIS_REQUIRE_DB` = `1` (website refuses to boot file-backed)
   - `MODEL_API_KEY` = paste the Meta key (same value as local `backend/.env`)
+  - `META_ADVANCED_MODEL` = exact Wonder model ID for codegen (ask Meta dashboard; e.g. wonder-full ID if provided, else leave unset for the default)
+  - `META_PRIMARY_MODEL` = exact Spark model ID for chat (leave unset for default)
+  - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` = mailer for login OTPs (Gmail App Password works; vmail works too)
   - `GENESIS_CORS_ORIGINS` = `https://genesis.webstudiobhiwadi.com`
   - (`PORT` is injected by Railway automatically.)
 - **Volume:** + New Volume, mount path `/data` (projects persist here).

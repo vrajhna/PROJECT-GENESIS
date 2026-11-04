@@ -4,6 +4,20 @@ import { useEffect, useRef, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_GENESIS_API || "http://127.0.0.1:8000";
 
+/* Auth transport: httpOnly cookie (server-set) + in-memory token fallback.
+   Nothing auth-related is ever written to browser storage: reload = re-login
+   unless the secure cookie is present. Every request carries credentials;
+   every write carries the CSRF header (required for cookie auth). */
+let memoryToken: string | null = null;
+
+function api(path: string, init: RequestInit = {}) {
+  const headers: Record<string, string> = { ...((init.headers as Record<string, string>) || {}) };
+  if (memoryToken && !headers["Authorization"]) headers["Authorization"] = `Bearer ${memoryToken}`;
+  const method = (init.method || "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD" && !headers["X-Genesis-CSRF"]) headers["X-Genesis-CSRF"] = "1";
+  return fetch(`${API}${path}`, { ...init, headers, credentials: "include" });
+}
+
 const AGENTS = [
   { lane: "architect", label: "Architect", desc: "spec → requirements" },
   { lane: "planner", label: "Planner", desc: "stack choices" },
@@ -59,14 +73,9 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   const [termReq, setTermReq] = useState<any>(null);
   const [termOut, setTermOut] = useState("");
   const [sugs, setSugs] = useState<any[]>([]);
-  const [mode, setMode] = useState<"new" | "improve">(() => {
-    try {
-      return window.localStorage.getItem("genesis_path") === "improve" ? "improve" : "new";
-    } catch {
-      return "new";
-    }
-  });
+  const [mode, setMode] = useState<"new" | "improve">("new");
   const [auto, setAuto] = useState<boolean | null>(null);
+  const [serverMode, setServerMode] = useState(true);
 
   /* ---- server account (email OTP, PaperOS-style) ---- */
   const [member, setMember] = useState<{ email: string; name: string } | null>(null);
@@ -78,11 +87,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   const [pubUrl, setPubUrl] = useState("");
 
   function authToken(): string | null {
-    try {
-      return window.localStorage.getItem("genesis-member-token");
-    } catch {
-      return null;
-    }
+    return memoryToken;
   }
 
   function authHeaders(): Record<string, string> {
@@ -93,22 +98,13 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   }
 
   async function refreshMe() {
-    const t = authToken();
-    if (!t) {
-      setMember(null);
-      return;
-    }
     try {
-      const r = await fetch(`${API}/api/me`, { headers: { Authorization: `Bearer ${t}` } });
+      const r = await api(`/api/me`);
       const j = await r.json();
       if (j.ok) setMember(j.member);
       else {
         setMember(null);
-        try {
-          window.localStorage.removeItem("genesis-member-token");
-        } catch {
-          /* ignore */
-        }
+        memoryToken = null;
       }
     } catch {
       /* offline — keep local state */
@@ -120,7 +116,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     if (!email) return setNotice("Type your email first.");
     setBusy("Sending code…");
     try {
-      const r = await fetch(`${API}/api/auth/request`, {
+      const r = await api(`/api/auth/request`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email }),
@@ -139,18 +135,14 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     if (!email || !authCode.trim()) return setNotice("Email + code, then verify.");
     setBusy("Verifying…");
     try {
-      const r = await fetch(`${API}/api/auth/verify`, {
+      const r = await api(`/api/auth/verify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, code: authCode.trim(), name: authName.trim() || undefined }),
       });
       const j = await r.json();
       if (j.ok) {
-        try {
-          window.localStorage.setItem("genesis-member-token", j.token);
-        } catch {
-          /* ignore */
-        }
+        memoryToken = j.token || null;
         setMember(j.member);
         setAuthOpen(false);
         setAuthCode("");
@@ -167,17 +159,12 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   }
 
   async function logout() {
-    const t = authToken();
     try {
-      if (t) await fetch(`${API}/api/auth/logout`, { method: "POST", headers: { Authorization: `Bearer ${t}` } });
+      await api(`/api/auth/logout`, { method: "POST" });
     } catch {
       /* ignore */
     }
-    try {
-      window.localStorage.removeItem("genesis-member-token");
-    } catch {
-      /* ignore */
-    }
+    memoryToken = null;
     setMember(null);
     setNotice("Logged out on this device.");
   }
@@ -190,7 +177,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     }
     setBusy("Publishing…");
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/publish`, { method: "POST", headers: authHeaders(), body: "{}" });
+      const r = await api(`/api/projects/${pid}/publish`, { method: "POST", headers: authHeaders(), body: "{}" });
       const j = await r.json();
       if (j.ok) {
         const url = `${API}${j.url}`;
@@ -207,7 +194,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     if (!pid || !authToken()) return;
     setBusy("Unpublishing…");
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/publish`, { method: "DELETE", headers: authHeaders() });
+      const r = await api(`/api/projects/${pid}/publish`, { method: "DELETE", headers: authHeaders() });
       const j = await r.json();
       if (j.ok) {
         setPubUrl("");
@@ -222,7 +209,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   async function flipAuto(v: boolean) {
     if (!pid) return setNotice("Create a project first.");
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/policy`, {
+      const r = await api(`/api/projects/${pid}/policy`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ autopilot: v }),
@@ -251,7 +238,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   async function fetchQuestions() {
     if (!pid) return;
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/questions`);
+      const r = await api(`/api/projects/${pid}/questions`);
       const j = await r.json();
       if (j.ok) {
         setQuestions(j.questions || []);
@@ -266,8 +253,10 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
 
   async function check() {
     try {
-      const r = await fetch(`${API}/api/health`);
+      const r = await api(`/api/health`);
+      const j = await r.json().catch(() => ({}));
       setOnline(r.ok);
+      if (j && j.mode) setServerMode(j.mode !== "local");
     } catch {
       setOnline(false);
     }
@@ -281,7 +270,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   async function newProject() {
     setBusy("Creating project…");
     try {
-      const r = await fetch(`${API}/api/projects`, {
+      const r = await api(`/api/projects`, {
         method: "POST",
         headers: authHeaders(),
         body: JSON.stringify({ name: pname || "Untitled" }),
@@ -306,7 +295,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     if (!pid) return setNotice("Create a project first.");
     setBusy("Understanding…");
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/spec`, {
+      const r = await api(`/api/projects/${pid}/spec`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ spec }),
@@ -331,7 +320,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     setMsg("");
     setChat((c) => [...c, { who: "you", text }]);
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/chat`, {
+      const r = await api(`/api/projects/${pid}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text }),
@@ -350,7 +339,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     setBusy("Building — scaffold, install, start, test. This takes a minute…");
     setReport(null);
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/${kind}`, {
+      const r = await api(`/api/projects/${pid}/${kind}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
@@ -377,7 +366,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     setPubUrl("");
     let runId = "";
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/fullstack?stream=true`, {
+      const r = await api(`/api/projects/${pid}/fullstack?stream=true`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ answers }),
@@ -392,6 +381,11 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     setBusy("Building live — agents working in parallel. Watch §4.");
     await new Promise<void>((resolve) => {
       const es = new EventSource(`${API}/api/projects/${pid}/build/stream?run_id=${runId}`);
+      try {
+        (es as any).withCredentials = true;
+      } catch {
+        /* ignore */
+      }
       esRef.current = es;
       es.addEventListener("step", (ev) => {
         try {
@@ -442,7 +436,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     const p = id || pid;
     if (!p) return;
     try {
-      const r = await fetch(`${API}/api/projects/${p}/tree`);
+      const r = await api(`/api/projects/${p}/tree`);
       setFiles((await r.json()).files || []);
     } catch {
       /* offline */
@@ -451,7 +445,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
 
   async function fetchDashboard() {
     try {
-      setDash(await (await fetch(`${API}/api/dashboard`, { headers: authHeaders() })).json());
+      setDash(await (await api(`/api/dashboard`, { headers: authHeaders() })).json());
     } catch {
       /* offline */
     }
@@ -463,7 +457,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       return setNotice("Login first — then claim it.");
     }
     try {
-      const r = await fetch(`${API}/api/projects/${id}/claim`, { method: "POST", headers: authHeaders() });
+      const r = await api(`/api/projects/${id}/claim`, { method: "POST", headers: authHeaders() });
       const j = await r.json();
       setNotice(j.ok ? "Claimed — it is yours now." : j.error || "Could not claim it.");
       fetchDashboard();
@@ -480,7 +474,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     if (!window.confirm(`Delete "${name}" forever? This removes the project and its published page. This cannot be undone.`)) return;
     setBusy("Deleting…");
     try {
-      const r = await fetch(`${API}/api/projects/${id}`, { method: "DELETE", headers: authHeaders() });
+      const r = await api(`/api/projects/${id}`, { method: "DELETE", headers: authHeaders() });
       const j = await r.json();
       if (j.ok) {
         if (pid === id) {
@@ -515,7 +509,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     setTermOut("");
     await refreshTree(id);
     try {
-      const p = await (await fetch(`${API}/api/projects/${id}`)).json();
+      const p = await (await api(`/api/projects/${id}`)).json();
       setAuto(p.project.policy ? p.project.policy.autopilot !== false : true);
       if (p.project && p.project.publish && p.project.publish.slug) {
         setPubUrl(`${API}/p/${p.project.publish.slug}/`);
@@ -524,7 +518,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
       /* offline */
     }
     try {
-      const s = await (await fetch(`${API}/api/projects/${id}/suggestions`)).json();
+      const s = await (await api(`/api/projects/${id}/suggestions`)).json();
       setSugs(s.suggestions || []);
     } catch {
       /* offline */
@@ -536,7 +530,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     setBusy("Running…");
     setPlayOut("");
     try {
-      const r = await fetch(`${API}/api/playground/run`, {
+      const r = await api(`/api/playground/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code: playCode, ...(save ? { save_as: playName } : {}) }),
@@ -565,7 +559,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     if (!pid) return setNotice("Create a project first.");
     try {
       const j = await (
-        await fetch(`${API}/api/projects/${pid}/terminal`, {
+        await api(`/api/projects/${pid}/terminal`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ argv: splitCmd(termCmd) }),
@@ -582,7 +576,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     if (!termReq || !pid) return;
     try {
       const j = await (
-        await fetch(`${API}/api/projects/${pid}/terminal/approve`, {
+        await api(`/api/projects/${pid}/terminal/approve`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ approval_id: termReq.approval_id, approved: ok }),
@@ -599,7 +593,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   async function loadSugs() {
     if (!pid) return setNotice("Create a project first.");
     try {
-      const j = await (await fetch(`${API}/api/projects/${pid}/suggestions`)).json();
+      const j = await (await api(`/api/projects/${pid}/suggestions`)).json();
       setSugs(j.suggestions || []);
     } catch {
       setNotice("Backend offline.");
@@ -609,7 +603,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
   async function openFile(path: string) {
     setSel(path);
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/files?path=${encodeURIComponent(path)}`);
+      const r = await api(`/api/projects/${pid}/files?path=${encodeURIComponent(path)}`);
       setCode((await r.json()).content || "");
     } catch {
       setCode("(offline)");
@@ -622,7 +616,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     fd.append("file", ev.target.files[0]);
     setBusy("Uploading and inspecting…");
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/upload`, { method: "POST", body: fd });
+      const r = await api(`/api/projects/${pid}/upload`, { method: "POST", body: fd });
       const j = await r.json();
       setNotice(j.ok ? `${j.summary}.` : `Rejected: ${j.error}`);
       refreshTree();
@@ -636,7 +630,7 @@ export default function Workspace({ win }: { win: (id: string) => void }) {
     if (!pid || !ghUrl.trim()) return;
     setBusy("Cloning…");
     try {
-      const r = await fetch(`${API}/api/projects/${pid}/github/clone`, {
+      const r = await api(`/api/projects/${pid}/github/clone`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: ghUrl }),

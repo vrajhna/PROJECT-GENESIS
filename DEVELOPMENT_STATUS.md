@@ -545,6 +545,35 @@
   run_id → poll → VERIFIED with review/live/secure lanes + report.json.
   Full suite: `117 passed` (2 live tests deselected — need a valid key).
 
+## 2026-11-03 — No more "model not found", no more local on the website
+
+- Model fallback chain: Wonder first; on HTTP 404 / model_not_found the
+  builder automatically retries the primary model, then offline templates.
+  Every author decision now names the tried models — failures are never
+  cryptic again. (`META_ADVANCED_MODEL` still selects the exact Wonder
+  variant with zero code change.)
+- Website auth is now cookie-only: `genesis_session` httpOnly,
+  SameSite=None (+Secure on https), 30-day sessions, logout clears it.
+  Browser localStorage holds NOTHING (memory-only token fallback, reload =
+  re-login unless the secure cookie is present). CSRF: cookie-authed
+  writes require `X-Genesis-CSRF: 1` + matching Origin; Bearer/API clients
+  unaffected; GETs exempt.
+- Server/local split is explicit: `server_mode()` from DATABASE_URL,
+  surfaced in `/api/health` (`mode`, `db`) and `GENESIS_REQUIRE_DB=1`
+  (Railway) refuses file-backed boot with a loud 503. Laptop/terminal
+  (no DATABASE_URL) keeps full file authority with zero login walls.
+- Everything shared lives in Postgres: users/otps/sessions/kv/hits/
+  experience/publishes-index (files only when pg is down). Projects stay
+  private per owner; create/read/build/publish/delete all gated; legacy
+  ownerless projects claimable, never visible to strangers.
+- Frontend: single `api()` helper (credentials + CSRF + token), login
+  without persistence, onboarding splits server (email login) vs local
+  (device profile); studio shows the live crew + your server identity.
+- Verified: full suite `127 passed` (+2 live-test skips), typecheck +
+  build clean, live restart proved health `mode/db`, cookie login flow
+  covered by tests, no-localStorage confirmed in the client bundle
+  (only the local-mode branch references it).
+
 ## 2026-11-03 — M6c: live agent cards in the studio (EventSource UI)
 
 - `Workspace.tsx`: `Build full app` now streams — POST `?stream=true`

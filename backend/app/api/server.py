@@ -54,6 +54,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
     allow_methods=["*"], allow_headers=["*"],
+    allow_credentials=True,
 )
 
 
@@ -241,16 +242,26 @@ def _zip_tree(base: Path, rels: list[str], arc_prefix: str) -> bytes:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "service": "genesis", "time": time.time()}
+    mode = server_mode()
+    if require_db() and mode != "server":
+        return JSONResponse(
+            {"ok": False, "service": "genesis", "mode": mode,
+             "error": "DATABASE_URL required (GENESIS_REQUIRE_DB=1) — refusing file mode"},
+            status_code=503)
+    db = "postgres" if mode == "server" else "sqlite/files"
+    return {"ok": True, "service": "genesis", "time": time.time(),
+            "mode": mode, "db": db}
 
 
 @app.post("/api/projects")
 def create_project(body: NewProject, request: Request):
+    me, error = need_member(request)
+    if error is not None:
+        return error
     pid = f"proj-{uuid.uuid4().hex[:8]}"
-    me = current_member(request)
     meta = {"id": pid, "name": body.name, "spec": "", "created": time.time(),
             "policy": {"autopilot": True},
-            "owner_email": me["email"] if me else ""}
+            "owner_email": "" if server_mode() == "local" else me["email"]}
     save_project(meta)
     return {"ok": True, "project": meta}
 
@@ -264,11 +275,89 @@ def _bearer(request: Request) -> str:
 
 
 def current_member(request: Request):
-    """Logged-in member dict or None. Never raises, never logs."""
+    """Logged-in member dict or None. Bearer token first, httpOnly cookie
+    second. Never raises, never logs."""
     try:
-        return accounts.member_from_token(_bearer(request))
+        t = _bearer(request) or _cookie_token(request)
+        return accounts.member_from_token(t) if t else None
     except Exception:
         return None
+
+
+SESSION_COOKIE = "genesis_session"
+CSRF_HEADER = "x-genesis-csrf"
+
+
+def _cookie_token(request: Request) -> str:
+    try:
+        return str(request.cookies.get(SESSION_COOKIE) or "")
+    except Exception:
+        return ""
+
+
+def _uses_cookie_auth(request: Request) -> bool:
+    return bool(_cookie_token(request)) and not _bearer(request)
+
+
+def _csrf_ok(request: Request) -> bool:
+    try:
+        if not _uses_cookie_auth(request):
+            return True
+        if request.headers.get(CSRF_HEADER) != "1":
+            return False
+        from urllib.parse import urlsplit
+        origin = request.headers.get("origin") or request.headers.get("referer") or ""
+        host = (urlsplit(origin).hostname or "").lower() if origin else ""
+        if not host:
+            return False
+        allowed = [urlsplit(o).hostname.lower() for o in _cors_origins() if "://" in o]
+        return host in allowed
+    except Exception:
+        return False
+
+
+def need_member(request: Request):
+    if server_mode() == "local":
+        # Laptop / terminal mode: your files, your machine — no login walls.
+        # (Server mode always requires a real login; see below.)
+        return {"email": "local@device", "name": "local"}, None
+    me = current_member(request)
+    if not me:
+        return None, err(request, "join first — login to continue", 401)
+    if request.method not in ("GET", "HEAD", "OPTIONS") and _uses_cookie_auth(request) and not _csrf_ok(request):
+        return None, err(request, "forbidden — bad origin", 403)
+    return me, None
+
+
+def need_access(pid: str, request: Request):
+    if server_mode() == "local":
+        meta = load_project(pid)
+        if meta is None:
+            return None, None, err(request, "unknown project", 404)
+        return {"email": "local@device", "name": "local"}, meta, None
+    me, error = need_member(request)
+    if error is not None:
+        return None, None, error
+    meta = load_project(pid)
+    if meta is None:
+        return None, None, err(request, "unknown project", 404)
+    owner = meta.get("owner_email") or ""
+    if owner and owner != me["email"]:
+        return None, None, err(request, "not yours — private to its owner", 403)
+    return me, meta, None
+
+
+def server_mode() -> str:
+    try:
+        from ..db import pg as _pgmod
+        return "server" if _pgmod.db_url() else "local"
+    except Exception:
+        return "local"
+
+
+def require_db() -> bool:
+    import os as _osmod
+    return _osmod.environ.get("GENESIS_REQUIRE_DB") == "1"
 
 
 class AuthEmailIn(BaseModel):
@@ -301,8 +390,19 @@ def auth_verify(body: AuthVerifyIn, request: Request):
                             status_code=400)
     except accounts.AuthFail as e:
         return err(request, e.message, e.status)
-    return {"ok": True, "token": out["token"],
-            "member": out["member"], "new": out["new"]}
+    resp = JSONResponse({"ok": True, "token": out["token"],
+                         "member": out["member"], "new": out["new"]})
+    secure = ""
+    try:
+        proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+        if proto == "https" or request.url.scheme == "https":
+            secure = "; Secure"
+    except Exception:
+        pass
+    resp.headers["set-cookie"] = (
+        f"{SESSION_COOKIE}={out['token']}; HttpOnly; SameSite=None{secure}; "
+        f"Path=/; Max-Age={30 * 24 * 3600}")
+    return resp
 
 
 @app.get("/api/me")
@@ -315,20 +415,23 @@ def auth_me(request: Request):
 
 @app.post("/api/auth/logout")
 def auth_logout(request: Request):
-    accounts.logout(_bearer(request))
-    return {"ok": True}
+    accounts.logout(_bearer(request) or _cookie_token(request))
+    resp = JSONResponse({"ok": True})
+    resp.headers["set-cookie"] = (
+        f"{SESSION_COOKIE}=; HttpOnly; SameSite=None; Path=/; Max-Age=0")
+    return resp
 
 
 @app.delete("/api/projects/{pid}")
 def delete_project(pid: str, request: Request):
-    me = current_member(request)
-    if not me:
-        return err(request, "join first — login to delete projects", 401)
+    me, error = need_member(request)
+    if error is not None:
+        return error
     meta = load_project(pid)
     if meta is None:
         return err(request, "unknown project", 404)
     owner = meta.get("owner_email") or ""
-    if owner != me["email"]:
+    if server_mode() != "local" and owner != me["email"]:
         if not owner:
             return err(request, "claim it first, then delete it", 403)
         return err(request, "not yours — only the owner can delete it", 403)
@@ -358,9 +461,9 @@ def delete_project(pid: str, request: Request):
 
 @app.post("/api/projects/{pid}/claim")
 def claim_project(pid: str, request: Request):
-    me = current_member(request)
-    if not me:
-        return err(request, "join first — login to claim projects", 401)
+    me, error = need_member(request)
+    if error is not None:
+        return error
     meta = load_project(pid)
     if meta is None:
         return err(request, "unknown project", 404)
@@ -375,12 +478,12 @@ def claim_project(pid: str, request: Request):
 
 @app.get("/api/projects")
 def list_projects(request: Request):
-    """Your projects only. Logged out sees nothing; logged in sees owned
-    projects plus unclaimed legacy ones (claim them to make them yours)."""
-    me = current_member(request)
+    """Your projects only (server mode). Laptop mode lists everything local.
+    Logged out on the website sees nothing — empty, not an error."""
+    me, error = need_member(request)
+    if error is not None:
+        return {"ok": True, "projects": []}
     out = []
-    if not me:
-        return {"ok": True, "projects": out}
     base = DATA_DIR / "projects"
     if base.exists():
         for meta in sorted(base.glob("*/project.json")):
@@ -397,9 +500,9 @@ def list_projects(request: Request):
 
 @app.get("/api/projects/{pid}")
 def get_project(pid: str, request: Request):
-    meta = load_project(pid)
-    if meta is None:
-        return err(request, "unknown project", 404)
+    _, meta, error = need_access(pid, request)
+    if error is not None:
+        return error
     return {"ok": True, "project": meta}
 
 
@@ -498,9 +601,9 @@ class PolicyIn(BaseModel):
 
 @app.post("/api/projects/{pid}/policy")
 def set_policy(pid: str, body: PolicyIn, request: Request):
-    meta = load_project(pid)
-    if meta is None:
-        return err(request, "unknown project", 404)
+    _, meta, error = need_access(pid, request)
+    if error is not None:
+        return error
     meta["policy"] = {"autopilot": body.autopilot}
     save_project(meta)
     return {"ok": True, "policy": meta["policy"]}
@@ -508,9 +611,9 @@ def set_policy(pid: str, body: PolicyIn, request: Request):
 
 @app.post("/api/projects/{pid}/spec")
 def set_spec(pid: str, body: SpecIn, request: Request):
-    meta = load_project(pid)
-    if meta is None:
-        return err(request, "unknown project", 404)
+    _, meta, error = need_access(pid, request)
+    if error is not None:
+        return error
     arch = ArchitectAgent().run(body.spec)
     if not arch.ok:
         return {"ok": True, "needs_clarification": True,
@@ -523,9 +626,9 @@ def set_spec(pid: str, body: SpecIn, request: Request):
 
 @app.post("/api/projects/{pid}/chat")
 def chat(pid: str, body: ChatIn, request: Request):
-    meta = load_project(pid)
-    if meta is None:
-        return err(request, "unknown project", 404)
+    _, meta, error = need_access(pid, request)
+    if error is not None:
+        return error
     text = body.message.strip()
     if len(text) < 20 and not meta.get("spec"):
         return {"ok": True, "mode": "clarify",
@@ -551,9 +654,9 @@ def chat(pid: str, body: ChatIn, request: Request):
 
 @app.post("/api/projects/{pid}/build")
 def build_project(pid: str, request: Request):
-    meta = load_project(pid)
-    if meta is None:
-        return err(request, "unknown project", 404)
+    _, meta, error = need_access(pid, request)
+    if error is not None:
+        return error
     if not meta.get("spec"):
         return err(request, "set a specification first (POST spec)", 400)
     workdir = proj_dir(pid) / "work"
@@ -564,9 +667,9 @@ def build_project(pid: str, request: Request):
 
 @app.get("/api/projects/{pid}/questions")
 def fullstack_questions(pid: str, request: Request):
-    meta = load_project(pid)
-    if meta is None:
-        return err(request, "unknown project", 404)
+    _, meta, error = need_access(pid, request)
+    if error is not None:
+        return error
     if not meta.get("spec"):
         return err(request, "set a specification first (POST /spec)", 400)
     arch = ArchitectAgent().run(meta["spec"])
@@ -580,9 +683,9 @@ def fullstack_questions(pid: str, request: Request):
 @app.post("/api/projects/{pid}/fullstack")
 def build_fullstack_app(pid: str, request: Request, body: FullstackIn | None = None,
                           stream: bool = False):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
-    meta = load_project(pid)
+    _, meta, error = need_access(pid, request)
+    if error is not None:
+        return error
     assert meta is not None
     if not meta.get("spec"):
         return err(request, "set a specification first (POST /spec)", 400)
@@ -621,6 +724,9 @@ def build_fullstack_app(pid: str, request: Request, body: FullstackIn | None = N
 @app.get("/api/projects/{pid}/build/status")
 def build_status(pid: str, request: Request, run_id: str = ""):
     from ..orchestrator import runs as runstore
+    me, error = need_member(request)
+    if error is not None:
+        return error
     run = runstore.get_run(run_id)
     if not run or run["pid"] != pid:
         return err(request, "unknown run", 404)
@@ -635,6 +741,9 @@ def build_status(pid: str, request: Request, run_id: str = ""):
 @app.get("/api/projects/{pid}/build/stream")
 def build_stream(pid: str, request: Request, run_id: str = ""):
     from ..orchestrator import runs as runstore
+    me, error = need_member(request)
+    if error is not None:
+        return error
     run = runstore.get_run(run_id)
     if not run or run["pid"] != pid:
         return err(request, "unknown run", 404)
@@ -734,15 +843,17 @@ def run_events(pid: str):
 
 @app.get("/api/projects/{pid}/tree")
 def tree(pid: str, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     return {"ok": True, "files": inspect_tree(proj_dir(pid) / "work")}
 
 
 @app.get("/api/projects/{pid}/files")
 def read_file(pid: str, path: str, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     try:
         content = GenesisWorkspace(proj_dir(pid) / "work").read_file(path)
     except (ValueError, OSError) as e:
@@ -752,8 +863,9 @@ def read_file(pid: str, path: str, request: Request):
 
 @app.post("/api/projects/{pid}/upload")
 async def upload_zip(pid: str, request: Request, file: UploadFile):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     data = await file.read()
     if len(data) > 100 * 1024 * 1024:
         return err(request, "zip too large (100 MB cap)", 400)
@@ -768,8 +880,9 @@ async def upload_zip(pid: str, request: Request, file: UploadFile):
 
 @app.get("/api/projects/{pid}/download")
 def download_zip(pid: str, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     from fastapi.responses import Response
     blob = make_zip(proj_dir(pid) / "work")
     return Response(blob, media_type="application/zip",
@@ -806,12 +919,42 @@ def _slugify(name: str, pid: str) -> str:
 
 def _publishes_index() -> dict:
     try:
+        from ..db import pg as _pg
+        con = _pg.connect()
+        if con is not None:
+            try:
+                v = _pg.kv_get(con, "publishes:index")
+                if isinstance(v, dict):
+                    return v
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
         return json.loads((PUBLISH_DIR / "publishes.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
 
 def _save_publishes_index(idx: dict) -> None:
+    try:
+        from ..db import pg as _pg
+        con = _pg.connect()
+        if con is not None:
+            try:
+                _pg.ensure_schema(con)
+                _pg.kv_set(con, "publishes:index", idx)
+                return
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
     try:
         PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
         (PUBLISH_DIR / "publishes.json").write_text(json.dumps(idx, indent=2), encoding="utf-8")
@@ -859,9 +1002,9 @@ class PublishIn(BaseModel):
 
 @app.post("/api/projects/{pid}/publish")
 def publish_project(pid: str, body: PublishIn, request: Request):
-    me = current_member(request)
-    if not me:
-        return err(request, "join first — login to publish", 401)
+    me, error = need_member(request)
+    if error is not None:
+        return error
     meta = load_project(pid)
     if meta is None:
         return err(request, "unknown project", 404)
@@ -897,9 +1040,9 @@ def publish_project(pid: str, body: PublishIn, request: Request):
 
 @app.delete("/api/projects/{pid}/publish")
 def unpublish_project(pid: str, request: Request):
-    me = current_member(request)
-    if not me:
-        return err(request, "join first — login to unpublish", 401)
+    me, error = need_member(request)
+    if error is not None:
+        return error
     meta = load_project(pid)
     if meta is None:
         return err(request, "unknown project", 404)
@@ -956,8 +1099,9 @@ def published_site(slug: str, rest: str):
 
 @app.post("/api/projects/{pid}/github/clone")
 def github_clone(pid: str, body: CloneIn, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     res = gh.clone(body.url, proj_dir(pid) / "work", branch=body.branch)
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "clone failed"))
@@ -966,15 +1110,17 @@ def github_clone(pid: str, body: CloneIn, request: Request):
 
 @app.get("/api/projects/{pid}/github/branches")
 def github_branches(pid: str, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     return gh.list_branches(proj_dir(pid) / "work")
 
 
 @app.post("/api/projects/{pid}/github/branch")
 def github_branch(pid: str, body: BranchIn, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     res = gh.create_branch(proj_dir(pid) / "work", body.name)
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "branch failed"))
@@ -982,9 +1128,10 @@ def github_branch(pid: str, body: BranchIn, request: Request):
 
 
 @app.get("/api/projects/{pid}/github/diff")
-def github_diff(pid: str, base: str = "HEAD"):
-    if load_project(pid) is None:
-        return {"ok": False, "error": "unknown project"}
+def github_diff(pid: str, request: Request, base: str = "HEAD"):
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return {"ok": False, "error": "private project — join to inspect it"}
     res = gh.diff_summary(proj_dir(pid) / "work", base=base)
     res.update(gh.run_tests_first(proj_dir(pid) / "work"))
     return res
@@ -992,8 +1139,9 @@ def github_diff(pid: str, base: str = "HEAD"):
 
 @app.post("/api/projects/{pid}/github/push")
 def github_push(pid: str, body: PushIn, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     res = gh.push(proj_dir(pid) / "work", body.branch, approved=body.approved)
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "push refused"))
@@ -1023,7 +1171,11 @@ def _project_stats(pid: str) -> dict:
 
 @app.get("/api/dashboard")
 def dashboard(request: Request):
-    projs = list_projects(request)["projects"]
+    listed = list_projects(request)
+    if not isinstance(listed, dict):
+        # logged out on the website: empty board, not an error
+        listed = {"ok": True, "projects": []}
+    projs = listed["projects"]
     items, verified, total_passed = [], 0, 0
     for p in projs:
         st = _project_stats(p["id"])
@@ -1067,8 +1219,12 @@ def playground_run(body: RunCodeIn, request: Request):
         result: dict = {"ok": proc.returncode == 0, "exit_code": proc.returncode,
                         "output": out, "note": "stdlib only; use Build for dependencies"}
         if body.save_as:
+            me, error = need_member(request)
+            if error is not None:
+                return err(request, "join first — login to save projects", 401)
             meta = {"id": f"proj-{uuid.uuid4().hex[:8]}", "name": body.save_as,
-                    "spec": "Playground experiment.", "created": time.time()}
+                    "spec": "Playground experiment.", "created": time.time(),
+                    "owner_email": me["email"]}
             save_project(meta)
             (proj_dir(meta["id"]) / "work").mkdir(parents=True, exist_ok=True)
             GenesisWorkspace(proj_dir(meta["id"]) / "work").create_file("main.py", body.code)
@@ -1128,9 +1284,9 @@ class TermApprove(BaseModel):
 
 @app.post("/api/projects/{pid}/terminal")
 def terminal_request(pid: str, body: TermIn, request: Request):
-    meta = load_project(pid)
-    if meta is None:
-        return err(request, "unknown project", 404)
+    _, meta, error = need_access(pid, request)
+    if error is not None:
+        return error
     if not all(isinstance(a, str) for a in body.argv) or len(" ".join(body.argv)) > 2000:
         return err(request, "argv must be a list of short strings (no shell)", 400)
     if (meta.get("policy") or {}).get("autopilot") and _auto_runnable(body.argv):
@@ -1156,8 +1312,9 @@ def terminal_request(pid: str, body: TermIn, request: Request):
 
 @app.post("/api/projects/{pid}/terminal/approve")
 def terminal_approve(pid: str, body: TermApprove, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     gate = _gates.setdefault(pid, ApprovalGate())
     if not body.approved:
         try:
@@ -1182,8 +1339,9 @@ def terminal_approve(pid: str, body: TermApprove, request: Request):
 
 @app.get("/api/projects/{pid}/suggestions")
 def suggestions(pid: str, request: Request):
-    if load_project(pid) is None:
-        return err(request, "unknown project", 404)
+    _, _, error = need_access(pid, request)
+    if error is not None:
+        return error
     work = proj_dir(pid) / "work"
     out: list[dict] = []
     if not work.exists() or not any(work.iterdir()):

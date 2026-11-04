@@ -63,15 +63,27 @@ def test_secure_scan_blocks_bad_tree(tmp_path):
     assert any("live secret" in f for f in findings)
 
 
-def test_questions_api_and_bad_answers_rejected(tmp_path):
+def test_questions_api_and_bad_answers_rejected(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     from app.api import server as srv
+    from app.auth import accounts as acc
+    import os
+    monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@127.0.0.1:1/x")
     srv.DATA_DIR = tmp_path / "data"
     c = TestClient(srv.app)
-    pid = c.post("/api/projects", json={"name": "Q"}).json()["project"]["id"]
+    codes = {}
+    monkeypatch.setattr(acc, "send_otp_mail",
+                        lambda to, code, mailer=None: codes.__setitem__(to, code))
+    email = "q@x.co"
+    assert c.post("/api/auth/request", json={"email": email}).status_code == 200
+    token = c.post("/api/auth/verify",
+                   json={"email": email, "code": codes[email], "name": "Q"}).json()["token"]
+    h = {"Authorization": "Bearer " + token}
+    pid = c.post("/api/projects", json={"name": "Q"}, headers=h).json()["project"]["id"]
     assert c.get(f"/api/projects/{pid}/questions").status_code == 400  # no spec yet
-    c.post(f"/api/projects/{pid}/spec", json={"spec": STORE})
+    c.post(f"/api/projects/{pid}/spec", json={"spec": STORE}, headers=h)
     q = c.get(f"/api/projects/{pid}/questions").json()
     assert q["ok"] and q["questions"][0]["id"] == "db"
-    bad = c.post(f"/api/projects/{pid}/fullstack", json={"answers": {"db": "oracle"}})
+    bad = c.post(f"/api/projects/{pid}/fullstack", json={"answers": {"db": "oracle"}}, headers=h)
     assert bad.status_code == 400

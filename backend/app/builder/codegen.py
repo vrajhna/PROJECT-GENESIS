@@ -131,6 +131,13 @@ def validate_files(files: dict) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _is_model_missing(error: str) -> bool:
+    """404/model_not_found (bad ID for this key) deserves a retry with the
+    other model; every other failure goes straight to templates."""
+    e = (error or "").lower()
+    return "model_not_found" in e or "model not found" in e or "http 404" in e
+
+
 def generate_with_model(spec: str, requirements: list, resources: list,
                         auth_on: bool, game_style: str,
                         client=None, router=None) -> dict:
@@ -172,11 +179,19 @@ def generate_with_model(spec: str, requirements: list, resources: list,
             "auth": "on" if auth_on else "off",
             "game": game_style or "none",
         })
+        tried: list = []
         routed = router.run("multi-file codegen", prompt)
+        tried.append(str(routed.get("model") or "?"))
+        if not routed.get("ok") and _is_model_missing(str(routed.get("error") or "")):
+            fallback_res = router.run("routine codegen", prompt)
+            tried.append(str(fallback_res.get("model") or "?"))
+            routed = fallback_res
         if not routed.get("ok"):
             return {"ok": False,
-                    "error": str(routed.get("error") or "model call failed"),
-                    "fallback": True}
+                    "error": f"models tried [{', '.join(tried)}]: "
+                             f"{routed.get('error') or 'model call failed'}",
+                    "fallback": True,
+                    "tried": tried}
         text = extract_text(routed.get("data") or {})
         if not text:
             return {"ok": False, "error": "empty model reply",

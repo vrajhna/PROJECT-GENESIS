@@ -80,15 +80,27 @@ def test_sse_frames_steps_and_done(tmp_path, monkeypatch):
     assert r3.json()["run"]["status"] == "done"
 
 
-def test_streamed_fullstack_build_verifies_live(tmp_path):
+def test_streamed_fullstack_build_verifies_live(tmp_path, monkeypatch):
     """End to end: stream=true returns immediately, status polls to a
     VERIFIED report with parallel lanes, report.json written."""
     from app.api import server as srv
+    from app.auth import accounts as acc
     c = _client(tmp_path)
-    pid = c.post("/api/projects", json={"name": "Stream Demo"}).json()["project"]["id"]
+    import os
+    monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@127.0.0.1:1/x")
+    codes = {}
+    monkeypatch.setattr(acc, "send_otp_mail",
+                        lambda to, code, mailer=None: codes.__setitem__(to, code))
+    email = "stream@x.co"
+    assert c.post("/api/auth/request", json={"email": email}).status_code == 200
+    token = c.post("/api/auth/verify",
+                   json={"email": email, "code": codes[email], "name": "S"}).json()["token"]
+    h = {"Authorization": "Bearer " + token}
+    pid = c.post("/api/projects", json={"name": "Stream Demo"}, headers=h).json()["project"]["id"]
     c.post(f"/api/projects/{pid}/spec",
-           json={"spec": "Users can register and log in. Users can create projects and tasks."})
-    r = c.post(f"/api/projects/{pid}/fullstack?stream=true", json={})
+           json={"spec": "Users can register and log in. Users can create projects and tasks."}, headers=h)
+    r = c.post(f"/api/projects/{pid}/fullstack?stream=true", json={}, headers=h)
     assert r.status_code == 200, r.text
     run_id = r.json()["run_id"]
     deadline = time.time() + 420

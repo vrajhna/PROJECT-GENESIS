@@ -79,13 +79,25 @@ def test_flappy_builds_with_flap_and_pipes(tmp_path: Path):
     assert any("Flappy" in d["decision"] for d in report["decisions"])
 
 
-def test_fullstack_api_end_to_end(tmp_path):
+def test_fullstack_api_end_to_end(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     from app.api import server as srv
+    from app.auth import accounts as acc
+    import os
+    monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@127.0.0.1:1/x")
     srv.DATA_DIR = tmp_path / "data"
     c = TestClient(srv.app)
-    pid = c.post("/api/projects", json={"name": "Shop"}).json()["project"]["id"]
-    c.post(f"/api/projects/{pid}/spec", json={"spec": STORE_SPEC})
-    res = c.post(f"/api/projects/{pid}/fullstack", timeout=600).json()
+    codes = {}
+    monkeypatch.setattr(acc, "send_otp_mail",
+                        lambda to, code, mailer=None: codes.__setitem__(to, code))
+    email = "shop@x.co"
+    assert c.post("/api/auth/request", json={"email": email}).status_code == 200
+    token = c.post("/api/auth/verify",
+                   json={"email": email, "code": codes[email], "name": "Shop"}).json()["token"]
+    h = {"Authorization": "Bearer " + token}
+    pid = c.post("/api/projects", json={"name": "Shop"}, headers=h).json()["project"]["id"]
+    c.post(f"/api/projects/{pid}/spec", json={"spec": STORE_SPEC}, headers=h)
+    res = c.post(f"/api/projects/{pid}/fullstack", timeout=600, headers=h).json()
     assert res["ok"] is True and res["report"]["verdict"] == "VERIFIED"
     assert any("auth" in d["decision"].lower() for d in res["report"]["decisions"])

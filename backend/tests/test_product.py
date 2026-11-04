@@ -37,35 +37,41 @@ def _client(tmp_path: Path) -> TestClient:
 
 def test_api_health_and_request_id(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@127.0.0.1:1/x")
     c = _client(tmp_path)
     r = c.get("/api/health")
     assert r.status_code == 200 and r.json()["ok"] is True
     assert r.headers.get("X-Request-ID", "").startswith("req-")
 
 
-def test_api_project_flow_and_build(tmp_path: Path, monkeypatch):
+def _login(c, tmp_path, monkeypatch, email="t@x.co"):
     import os
-    monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
     from app.auth import accounts as acc
+    monkeypatch.setenv("GENESIS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@127.0.0.1:1/x")
     codes = {}
     monkeypatch.setattr(acc, "send_otp_mail",
                         lambda to, code, mailer=None: codes.__setitem__(to, code))
-    c = _client(tmp_path)
-    email = "flow@x.co"
     assert c.post("/api/auth/request", json={"email": email}).status_code == 200
-    token = c.post("/api/auth/verify",
-                   json={"email": email, "code": codes[email], "name": "Flow"}).json()["token"]
-    h = {"Authorization": "Bearer " + token}
+    r = c.post("/api/auth/verify",
+               json={"email": email, "code": codes[email], "name": "Tester"})
+    assert r.status_code == 200, r.text
+    return {"Authorization": "Bearer " + r.json()["token"]}
+
+
+def test_api_project_flow_and_build(tmp_path: Path, monkeypatch):
+    c = _client(tmp_path)
+    h = _login(c, tmp_path, monkeypatch, email="flow@x.co")
     pid = c.post("/api/projects", json={"name": "Demo"}, headers=h).json()["project"]["id"]
     assert c.get(f"/api/projects/{pid}").json()["project"]["name"] == "Demo"
     assert c.get("/api/projects", headers=h).json()["projects"][0]["id"] == pid
-    spec = c.post(f"/api/projects/{pid}/spec", json={"spec": SPEC}).json()
+    spec = c.post(f"/api/projects/{pid}/spec", json={"spec": SPEC}, headers=h).json()
     assert spec["ok"] is True and len(spec["requirements"]) == 2
-    chat = c.post(f"/api/projects/{pid}/chat", json={"message": "also add search"}).json()
+    chat = c.post(f"/api/projects/{pid}/chat", json={"message": "also add search"}, headers=h).json()
     assert chat["ok"] is True and chat["mode"] == "plan"
-    short = c.post(f"/api/projects/{pid}/chat", json={"message": "hi"}).json()
+    short = c.post(f"/api/projects/{pid}/chat", json={"message": "hi"}, headers=h).json()
     assert short["mode"] in ("plan", "clarify")
-    build = c.post(f"/api/projects/{pid}/build", timeout=600).json()
+    build = c.post(f"/api/projects/{pid}/build", timeout=600, headers=h).json()
     assert build["ok"] is True and build["report"]["verdict"] == "VERIFIED"
     assert c.get(f"/api/projects/{pid}/report").json()["ok"] is True
     tree = c.get(f"/api/projects/{pid}/tree").json()
@@ -74,34 +80,36 @@ def test_api_project_flow_and_build(tmp_path: Path, monkeypatch):
     assert "requirements" in content["content"]
 
 
-def test_api_zip_upload_download(tmp_path: Path):
+def test_api_zip_upload_download(tmp_path: Path, monkeypatch):
     c = _client(tmp_path)
-    pid = c.post("/api/projects", json={"name": "Zip"}).json()["project"]["id"]
+    h = _login(c, tmp_path, monkeypatch, email="zip@x.co")
+    pid = c.post("/api/projects", json={"name": "Zip"}, headers=h).json()["project"]["id"]
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("hello.py", "print(1)\n")
-    r = c.post(f"/api/projects/{pid}/upload",
+    r = c.post(f"/api/projects/{pid}/upload", headers=h,
                files={"file": ("proj.zip", buf.getvalue(), "application/zip")})
     assert r.json()["ok"] is True
     bad = io.BytesIO()
     with zipfile.ZipFile(bad, "w") as zf:
         zf.writestr("../../evil.py", "x")
-    r2 = c.post(f"/api/projects/{pid}/upload",
+    r2 = c.post(f"/api/projects/{pid}/upload", headers=h,
                 files={"file": ("evil.zip", bad.getvalue(), "application/zip")})
     assert r2.json()["ok"] is False
     dl = c.get(f"/api/projects/{pid}/download")
     assert dl.status_code == 200 and dl.headers["content-type"] == "application/zip"
 
 
-def test_api_github_honesty(tmp_path: Path):
+def test_api_github_honesty(tmp_path: Path, monkeypatch):
     c = _client(tmp_path)
+    h = _login(c, tmp_path, monkeypatch, email="gh@x.co")
     st = c.get("/api/github/connect").json()
     assert set(st) >= {"ok"}
     if st["ok"]:
         assert st.get("login")
     else:
         assert "error" in st
-    pid = c.post("/api/projects", json={"name": "Gh"}).json()["project"]["id"]
+    pid = c.post("/api/projects", json={"name": "Gh"}, headers=h).json()["project"]["id"]
     r = c.post(f"/api/projects/{pid}/github/clone",
-               json={"url": "https://example.com/o/r"})
+               json={"url": "https://example.com/o/r"}, headers=h)
     assert r.status_code == 400

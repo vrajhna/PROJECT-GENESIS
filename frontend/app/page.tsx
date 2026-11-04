@@ -563,19 +563,29 @@ function Boot({ onExplore }: { onExplore: () => void }) {
   );
 }
 
-function Onboard({ onDone }: { onDone: (name: string) => void }) {
+function Onboard({ onDone, server }: { onDone: (name: string) => void; server: boolean }) {
   const [name, setName] = useState("");
   const [path, setPath] = useState<"new" | "improve">("new");
   function done() {
-    const who = name.trim() || "builder";
-    try { window.localStorage.setItem("genesis_path", path); } catch { /* private mode */ }
-    onDone(who);
+    onDone(server ? "" : name.trim() || "builder");
+  }
+  if (server) {
+    return (
+      <div className="doc-inner">
+        <p className="crumb">$ whoami — 30 seconds, once</p>
+        <h1 className="doctitle">Log in with email.</h1>
+        <p className="docsub">Server accounts live here — code by email, no passwords, nothing stored in this browser. Your projects stay private to you.</p>
+        <p style={{ marginTop: 12 }}>
+          <button type="button" className="btn primary" onClick={done}>[enter studio →]</button>
+        </p>
+      </div>
+    );
   }
   return (
     <div className="doc-inner">
       <p className="crumb">$ whoami — 30 seconds, once</p>
       <h1 className="doctitle">Log in on this device.</h1>
-      <p className="docsub">A local profile — your name stays in this browser, on this machine. No password. Want your work under your name everywhere? Log in inside the studio — code by email.</p>
+      <p className="docsub">A local profile — your name stays in this browser session only, on this machine. No password, no account. (On the website, server login replaces this.)</p>
       <p>
         <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && done()}
           placeholder="your name" aria-label="Your name"
@@ -952,21 +962,35 @@ export default function Editor() {
   const [specOpen, setSpecOpen] = useState(false);
   const [stage, setStage] = useState<"boot" | "onboard" | "app">("boot");
   const [profile, setProfile] = useState("");
+  const [serverMode, setServerMode] = useState(true);
 
   useEffect(() => {
-    try {
-      const s = window.localStorage.getItem("genesis_stage");
-      const p = window.localStorage.getItem("genesis_profile") || "";
-      setProfile(p);
-      if (s === "app" && p) setStage("app");
-    } catch { /* private mode */ }
+    let cancelled = false;
+    (async () => {
+      let server = true;
+      try {
+        const r = await fetch(`${API}/api/health`);
+        const j = await r.json().catch(() => ({}));
+        if (j && j.mode) server = j.mode !== "local";
+      } catch {
+        /* offline — stay in server assumption */
+      }
+      if (cancelled) return;
+      setServerMode(server);
+      if (server) return; // website: no local reads, no local profile
+      try {
+        const s = window.localStorage.getItem("genesis_stage");
+        const p = window.localStorage.getItem("genesis_profile") || "";
+        setProfile(p);
+        if (s === "app" && p) setStage("app");
+      } catch { /* private mode */ }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   function enter(name: string) {
-    try {
-      window.localStorage.setItem("genesis_profile", name);
-      window.localStorage.setItem("genesis_stage", "app");
-    } catch { /* private mode */ }
     setProfile(name);
     setStage("app");
     win("open-studio");
@@ -996,7 +1020,7 @@ export default function Editor() {
     return (
       <div className="shell">
         <main className="doc">
-          <Boot onExplore={() => (profile ? (setStage("app"), win("open-studio")) : setStage("onboard"))} />
+          <Boot onExplore={() => (serverMode || profile ? (setStage("app"), win("open-studio")) : setStage("onboard"))} />
         </main>
       </div>
     );
@@ -1005,7 +1029,7 @@ export default function Editor() {
     return (
       <div className="shell">
         <main className="doc">
-          <Onboard onDone={enter} />
+          <Onboard onDone={enter} server={serverMode} />
         </main>
       </div>
     );
